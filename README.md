@@ -14,54 +14,50 @@ Train multi-step agents for real-world tasks using GRPO.
 
 [![PRs-Welcome][contribute-image]][contribute-url]
 [![PyPI version](https://img.shields.io/pypi/v/openpipe-art?color=364fc7)][pypi-url]
-[![Train Agent](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb)
+[![Train Agent](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb)
 
 [![Join Discord](https://img.shields.io/badge/Join%20Discord-5865F2?style=plastic&logo=discord&logoColor=white)](https://discord.gg/zbBHRUpwf4)
 [![Documentation](https://img.shields.io/badge/Documentation-orange?style=plastic&logo=gitbook&logoColor=white)](https://art.openpipe.ai)
 
 </div>
 
-## 🔌 MCP•RL: Teach your agents to master MCP
+## 🦜🔗 LangGraph Integration: Build Smarter Multi-Step Agents
 
-<img src="assets/MCP_RL_diagram.svg" width="7000">
+ART's **LangGraph integration** enables you to train sophisticated ReAct-style agents that improve through reinforcement learning. Build agents that reason, use tools, and adapt their behavior over time without manual prompt engineering.
 
-**MCP•RL** enables you to train agents to effectively use any MCP (Model Context Protocol) server with minimal setup. Simply provide a server URL and MCP•RL will:
+✨ **Key Benefits:**
 
-1. Automatically discover server tools
-2. Design input tasks that utilize those tools
-3. Train the model to improve performance on the MCP server using RULER
-4. Test on new tasks to validate the trained model
-
-✨ **Key Features:**
-
-- **No labeled data** - MCP•RL learns what tasks a server will be used for by analyzing its tools
-- **General-purpose** - Optimizes models for any MCP server
-- **Strong performance** - Matches or exceeds SOTA performance in 2/3 benchmarks
-- **Easy integration** - No customization of your MCP server required!
+- **Automatic behavior improvement** - Train agents to get better at multi-step reasoning
+- **Tool usage optimization** - Learn when and how to use tools more effectively
+- **Seamless integration** - Drop-in replacement for LangGraph's LLM initialization
+- **RULER compatibility** - Train without hand-crafted reward functions
 
 ```python
-from art.rewards import ruler_score_group
+import art
+from art.langgraph import init_chat_model, wrap_rollout
+from langgraph.prebuilt import create_react_agent
 
-# Specialize a model for NWS MCP server
-MCP_SERVER_URL = "https://server.smithery.ai/@smithery-ai/national-weather-service/mcp"
+async def email_rollout(model: art.Model, scenario: str) -> art.Trajectory:
+    # Create LangGraph agent with ART's chat model
+    chat_model = init_chat_model(model.name)
+    agent = create_react_agent(chat_model, tools)
 
-# Generate training scenarios based on MCP tools
-scenarios = await generate_scenarios(
-    num_scenarios=24,
-    server_url=MCP_SERVER_URL,
-)
+    await agent.ainvoke({"messages": [("user", scenario)]})
+    return art.Trajectory(reward=1.0, messages_and_choices=[])
 
-# ...run the agent...
+# Train your agent
+scenarios = ["Find urgent emails", "Search Q4 budget"]
 
-# Use RULER to assign relative scores to each trajectory
-scored_groups = []
-for group in groups:
-    judged_group = await ruler_score_group(group)
-    scored_groups.append(judged_group)
+# Using wrap_rollout (captures interactions automatically)
+groups = await art.gather_trajectory_groups([
+    art.TrajectoryGroup(wrap_rollout(model, email_rollout)(model, s) for _ in range(4))
+    for s in scenarios
+])
 
-# Train the model to improve performance on the MCP server
-await model.train(scored_groups)
+await model.train(groups)
 ```
+
+[📖 Learn more about LangGraph integration →](https://art.openpipe.ai/integrations/langgraph-integration) | [🏋️ Try the notebook →](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/langgraph/art-e-langgraph.ipynb)
 
 ## ART Overview
 
@@ -69,15 +65,16 @@ ART is an open-source RL framework that improves agent reliability by allowing L
 
 ## 📒 Notebooks
 
-| Agent Task         | Example Notebook                                                                                                             | Description                                     | Comparative Performance                                                                                                                                                                             |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **MCP•RL**         | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/mcp-rl/mcp-rl.ipynb)               | Qwen 2.5 3B masters the NWS MCP server          | [Link coming soon]                                                                                                                                                                                  |
-| **ART•E [RULER]**  | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/art-e.ipynb)                       | Qwen 2.5 7B learns to search emails using RULER | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/email_agent/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/art-e/art_e/evaluate/display_benchmarks.ipynb) |
-| **2048**           | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/2048/2048.ipynb)                   | Qwen 2.5 3B learns to play 2048                 | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/2048/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/2048/benchmark_2048.ipynb)                            |
-| **Temporal Clue**  | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/temporal_clue/temporal-clue.ipynb) | Qwen 2.5 7B learns to solve Temporal Clue       | [Link coming soon]                                                                                                                                                                                  |
-| **Tic Tac Toe**    | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/tic_tac_toe/tic-tac-toe.ipynb)     | Qwen 2.5 3B learns to play Tic Tac Toe          | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/tic-tac-toe-local/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/tic_tac_toe/benchmark_tic_tac_toe.ipynb) |
-| **Codenames**      | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/codenames/Codenames_RL.ipynb)      | Qwen 2.5 3B learns to play Codenames            | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/codenames/win_rate_over_time.png" height="72"> [benchmarks](/examples/codenames/Codenames_RL.ipynb)                            |
-| **AutoRL [RULER]** | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art/blob/main/examples/auto_rl.ipynb)                     | Train Qwen 2.5 7B to master any task            | [Link coming soon]                                                                                                                                                                                  |
+| Agent Task          | Example Notebook                                                                                                                       | Description                                         | Comparative Performance                                                                                                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **ART•E LangGraph** | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/langgraph/art-e-langgraph.ipynb)   | Qwen 2.5 7B learns to search emails using LangGraph | [Link coming soon]                                                                                                                                                                                  |
+| **MCP•RL**          | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/mcp-rl/mcp-rl.ipynb)               | Qwen 2.5 3B masters the NWS MCP server              | [Link coming soon]                                                                                                                                                                                  |
+| **ART•E [RULER]**   | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/art-e.ipynb)                       | Qwen 2.5 7B learns to search emails using RULER     | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/email_agent/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/art-e/art_e/evaluate/display_benchmarks.ipynb) |
+| **2048**            | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb)                   | Qwen 2.5 3B learns to play 2048                     | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/2048/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/2048/benchmark_2048.ipynb)                            |
+| **Temporal Clue**   | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/temporal_clue/temporal-clue.ipynb) | Qwen 2.5 7B learns to solve Temporal Clue           | [Link coming soon]                                                                                                                                                                                  |
+| **Tic Tac Toe**     | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/tic_tac_toe/tic-tac-toe.ipynb)     | Qwen 2.5 3B learns to play Tic Tac Toe              | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/tic-tac-toe-local/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/tic_tac_toe/benchmark_tic_tac_toe.ipynb) |
+| **Codenames**       | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/codenames/Codenames_RL.ipynb)      | Qwen 2.5 3B learns to play Codenames                | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/codenames/win_rate_over_time.png" height="72"> [benchmarks](/examples/codenames/Codenames_RL.ipynb)                            |
+| **AutoRL [RULER]**  | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/auto_rl.ipynb)                     | Train Qwen 2.5 7B to master any task                | [Link coming soon]                                                                                                                                                                                  |
 
 ## 📰 ART News
 
