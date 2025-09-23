@@ -16,10 +16,24 @@ if os.environ.get("IMPORT_PEFT", "0") == "1":
         conf.remove("expandable_segments:True")
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
 
+try:
+    import transformers  # type: ignore
+
+    try:
+        from .transformers.patches import patch_preprocess_mask_arguments
+
+        patch_preprocess_mask_arguments()
+    except Exception:
+        pass
+except ImportError:
+    pass
+
+
 from . import dev
 from .auto_trajectory import auto_trajectory, capture_auto_trajectory
 from .backend import Backend
 from .batches import trajectory_group_batches
+from .client import Client
 from .gather import gather_trajectories, gather_trajectory_groups
 from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
@@ -35,6 +49,7 @@ __all__ = [
     "gather_trajectory_groups",
     "trajectory_group_batches",
     "Backend",
+    "Client",
     "Messages",
     "MessagesAndChoices",
     "Tools",
