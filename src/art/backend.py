@@ -1,18 +1,28 @@
 import json
-from typing import TYPE_CHECKING, AsyncIterator, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, TypeAlias
+import warnings
 
 import httpx
 from tqdm import auto as tqdm
 
 from art.utils import log_http_errors
-from art.utils.deploy_model import LoRADeploymentJob, LoRADeploymentProvider
+from art.utils.deployment import (
+    DeploymentResult,
+    Provider,
+    TogetherDeploymentConfig,
+    WandbDeploymentConfig,
+)
 
 from . import dev
 from .trajectories import TrajectoryGroup
-from .types import TrainConfig
+from .types import TrainConfig, TrainResult
 
 if TYPE_CHECKING:
     from .model import Model, TrainableModel
+
+# Type aliases for models with any config/state type (for backend method signatures)
+AnyModel: TypeAlias = "Model[Any, Any]"
+AnyTrainableModel: TypeAlias = "TrainableModel[Any, Any]"
 
 
 class Backend:
@@ -33,7 +43,7 @@ class Backend:
 
     async def register(
         self,
-        model: "Model",
+        model: AnyModel,
     ) -> None:
         """
         Registers a model with the Backend for logging and/or training.
@@ -44,27 +54,25 @@ class Backend:
         response = await self._client.post("/register", json=model.safe_model_dump())
         response.raise_for_status()
 
-    async def _get_step(self, model: "TrainableModel") -> int:
+    async def _get_step(self, model: AnyTrainableModel) -> int:
         response = await self._client.post("/_get_step", json=model.safe_model_dump())
         response.raise_for_status()
         return response.json()
 
-    async def _delete_checkpoints(
+    async def _delete_checkpoint_files(
         self,
-        model: "TrainableModel",
-        benchmark: str,
-        benchmark_smoothing: float,
+        model: AnyTrainableModel,
+        steps_to_keep: list[int],
     ) -> None:
         response = await self._client.post(
-            "/_delete_checkpoints",
-            json=model.safe_model_dump(),
-            params={"benchmark": benchmark, "benchmark_smoothing": benchmark_smoothing},
+            "/_delete_checkpoint_files",
+            json={"model": model.safe_model_dump(), "steps_to_keep": steps_to_keep},
         )
         response.raise_for_status()
 
     async def _prepare_backend_for_training(
         self,
-        model: "TrainableModel",
+        model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, str]:
         response = await self._client.post(
@@ -76,26 +84,41 @@ class Backend:
         base_url, api_key = tuple(response.json())
         return base_url, api_key
 
-    async def _log(
+    def _model_inference_name(self, model: AnyModel, step: int | None = None) -> str:
+        """Return the inference name for a model checkpoint.
+
+        Override in subclasses to provide backend-specific naming.
+        Default implementation returns model.name with optional @step suffix.
+        """
+        base_name = model.inference_model_name or model.name
+        if step is not None:
+            return f"{base_name}@{step}"
+        return base_name
+
+    async def train(
         self,
-        model: "Model",
-        trajectory_groups: list[TrajectoryGroup],
-        split: str = "val",
-    ) -> None:
-        response = await self._client.post(
-            "/_log",
-            json={
-                "model": model.safe_model_dump(),
-                "trajectory_groups": [tg.model_dump() for tg in trajectory_groups],
-                "split": split,
-            },
-            timeout=None,
+        model: AnyTrainableModel,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        **kwargs: Any,
+    ) -> TrainResult:
+        """Train the model on the given trajectory groups.
+
+        This method is not implemented in the base Backend class. Use
+        LocalBackend, ServerlessBackend, or TinkerBackend directly for training.
+
+        Raises:
+            NotImplementedError: Always raised. Use a concrete backend instead.
+        """
+        raise NotImplementedError(
+            "The base Backend class does not support the train() method. "
+            "Use LocalBackend, ServerlessBackend, or TinkerBackend directly. "
+            "If you are using the 'art run' server, consider using LocalBackend "
+            "in-process instead."
         )
-        response.raise_for_status()
 
     async def _train_model(
         self,
-        model: "TrainableModel",
+        model: AnyTrainableModel,
         trajectory_groups: list[TrajectoryGroup],
         config: TrainConfig,
         dev_config: dev.TrainConfig,
@@ -133,7 +156,7 @@ class Backend:
     @log_http_errors
     async def _experimental_pull_from_s3(
         self,
-        model: "Model",
+        model: AnyModel,
         *,
         s3_bucket: str | None = None,
         prefix: str | None = None,
@@ -143,10 +166,18 @@ class Backend:
     ) -> None:
         """Download the model directory from S3 into file system where the LocalBackend is running. Right now this can be used to pull trajectory logs for processing or model checkpoints.
 
+        .. deprecated::
+            This method is deprecated. Use `_experimental_pull_model_checkpoint` instead.
+
         Args:
             only_step: If specified, only pull this specific step. Can be an int for a specific step,
                       or "latest" to pull only the latest checkpoint. If None, pulls all steps.
         """
+        warnings.warn(
+            "_experimental_pull_from_s3 is deprecated. Use _experimental_pull_model_checkpoint instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         response = await self._client.post(
             "/_experimental_pull_from_s3",
             json={
@@ -164,7 +195,7 @@ class Backend:
     @log_http_errors
     async def _experimental_push_to_s3(
         self,
-        model: "Model",
+        model: AnyModel,
         *,
         s3_bucket: str | None = None,
         prefix: str | None = None,
@@ -188,7 +219,7 @@ class Backend:
     @log_http_errors
     async def _experimental_fork_checkpoint(
         self,
-        model: "Model",
+        model: AnyModel,
         from_model: str,
         from_project: str | None = None,
         from_s3_bucket: str | None = None,
@@ -223,38 +254,3 @@ class Backend:
             timeout=600,
         )
         response.raise_for_status()
-
-    @log_http_errors
-    async def _experimental_deploy(
-        self,
-        deploy_to: LoRADeploymentProvider,
-        model: "TrainableModel",
-        step: int | None = None,
-        s3_bucket: str | None = None,
-        prefix: str | None = None,
-        verbose: bool = False,
-        pull_s3: bool = True,
-        wait_for_completion: bool = True,
-    ) -> LoRADeploymentJob:
-        """
-        Deploy the model's latest checkpoint to a hosted inference endpoint.
-
-        Together is currently the only supported provider. See link for supported base models:
-        https://docs.together.ai/docs/lora-inference#supported-base-models
-        """
-        response = await self._client.post(
-            "/_experimental_deploy",
-            json={
-                "deploy_to": deploy_to,
-                "model": model.safe_model_dump(),
-                "step": step,
-                "s3_bucket": s3_bucket,
-                "prefix": prefix,
-                "verbose": verbose,
-                "pull_s3": pull_s3,
-                "wait_for_completion": wait_for_completion,
-            },
-            timeout=600,
-        )
-        response.raise_for_status()
-        return LoRADeploymentJob(**response.json())

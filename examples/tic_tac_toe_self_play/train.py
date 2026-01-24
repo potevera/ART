@@ -7,8 +7,10 @@ from dotenv import load_dotenv
 from game_utils import possible_moves
 from gather_trajectory_groups_by_index import gather_trajectory_groups_by_index
 from rollout import ModelConfig, TicTacToeScenario, rollout
+import weave
 
 import art
+from art.utils.strip_logprobs import strip_logprobs
 
 load_dotenv()
 
@@ -22,6 +24,8 @@ CLUSTER_NAME = "art4"
 PROJECT_NAME = "tic-tac-toe"
 BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 MODEL_NAME = "llama-8b-student-001"
+
+weave.init("tic-tac-toe", global_postprocess_output=strip_logprobs)
 
 
 async def main():
@@ -136,10 +140,12 @@ async def main():
             await model.log(model_trajectories, split="val")
 
         # await model.delete_checkpoints()
-        await model.train(
-            trajectory_groups=[x_trajectory_group, o_trajectory_group],
-            config=art.TrainConfig(learning_rate=2e-5),
-            verbose=True,
+        trajectory_groups = [x_trajectory_group, o_trajectory_group]
+        result = await backend.train(
+            model, trajectory_groups, learning_rate=2e-5, verbose=True
+        )
+        await model.log(
+            trajectory_groups, metrics=result.metrics, step=result.step, split="train"
         )
         await backend._experimental_push_to_s3(model)
 

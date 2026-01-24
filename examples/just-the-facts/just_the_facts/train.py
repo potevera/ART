@@ -1,9 +1,9 @@
 import asyncio
 import os
 
-import weave
 from dotenv import load_dotenv
 from rollout import rollout
+import weave
 
 import art
 from art.utils import iterate_dataset
@@ -81,13 +81,13 @@ async def train(
             ),
         )
 
-        await model.train(
+        result = await backend.train(
+            model,
             groups,
-            config=art.TrainConfig(learning_rate=model.config.learning_rate),
-            _config=art.dev.TrainConfig(
-                scale_rewards=model.config.scale_rewards,
-            ),
+            learning_rate=model.config.learning_rate,
+            scale_rewards=model.config.scale_rewards,
         )
+        await model.log(groups, metrics=result.metrics, step=result.step, split="train")
 
         await backend._experimental_push_to_s3(model)
 
