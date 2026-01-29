@@ -153,7 +153,7 @@ class Model(
         *args,
         **kwargs,
     ) -> "Model[ModelConfig, StateType]":
-        return super().__new__(cls)  # type: ignore[return-value]
+        return super().__new__(cls)
 
     def safe_model_dump(self, *args, **kwargs) -> dict:
         """
@@ -174,7 +174,7 @@ class Model(
     async def register(self, backend: "Backend") -> None:
         if self.config is not None:
             try:
-                self.config.model_dump_json()
+                self.config.model_dump_json()  # ty:ignore[invalid-argument-type, possibly-missing-attribute]
             except Exception as e:
                 raise ValueError(
                     "The model config cannot be serialized to JSON. Please ensure that all fields are JSON serializable and try again."
@@ -261,18 +261,22 @@ class Model(
         """Get the output directory for this model."""
         return f"{self.base_path}/{self.project}/models/{self.name}"
 
-    def write_state(self, state: StateType) -> None:
-        """Write persistent state to the model directory as JSON.
+    def overwrite_state(self, state: StateType) -> None:
+        """Overwrite persistent state in the model directory as JSON.
 
         This state is stored in `state.json` within the model's output directory
         and can be used to track training progress, dataset position, or any
         other information that should persist across runs.
 
+        Warning:
+            This overwrites the entire state file. Prefer `merge_state()` unless
+            you intentionally want to replace all existing keys.
+
         Args:
             state: A dictionary of JSON-serializable values to persist.
 
         Example:
-            model.write_state({
+            model.overwrite_state({
                 "step": 5,
                 "dataset_offset": 100,
                 "last_checkpoint_time": "2024-01-15T10:30:00",
@@ -282,6 +286,45 @@ class Model(
         os.makedirs(output_dir, exist_ok=True)
         with open(f"{output_dir}/state.json", "w") as f:
             json.dump(state, f, indent=2)
+
+    def write_state(self, state: StateType) -> None:
+        """Deprecated: use `overwrite_state()` or `merge_state()` instead."""
+        warnings.warn(
+            "write_state() is deprecated. Use overwrite_state() or merge_state() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.overwrite_state(state)
+
+    def merge_state(self, state: StateType) -> StateType:
+        """Deep-merge state into the existing state and persist it.
+
+        Args:
+            state: A dictionary of JSON-serializable values to merge.
+
+        Returns:
+            The merged state dictionary that was persisted.
+        """
+        existing = self.read_state() or {}
+        merged = self._deep_merge_dicts(existing, state)
+        self.overwrite_state(merged)
+        return cast(StateType, merged)
+
+    @staticmethod
+    def _deep_merge_dicts(
+        base: dict[str, Any], updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        merged = dict(base)
+        for key, value in updates.items():
+            if (
+                key in merged
+                and isinstance(merged[key], dict)
+                and isinstance(value, dict)
+            ):
+                merged[key] = Model._deep_merge_dicts(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
 
     def read_state(self) -> StateType | None:
         """Read persistent state from the model directory.
@@ -500,7 +543,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             entity=entity,
             id=id,
             config=config,
-            base_model=base_model,  # type: ignore
+            base_model=base_model,
             base_path=base_path,
             report_metrics=report_metrics,
             **kwargs,
@@ -544,7 +587,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         *args,
         **kwargs,
     ) -> "TrainableModel[ModelConfig, StateType]":
-        return super().__new__(cls)  # type: ignore
+        return super().__new__(cls)
 
     def model_dump(self, *args, **kwargs) -> dict:
         data = super().model_dump(*args, **kwargs)
@@ -649,7 +692,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             stacklevel=2,
         )
         groups_list = list(trajectory_groups)
-        _config = _config or {}
+        _config = _config or {}  # ty:ignore[invalid-assignment]
 
         # 1. Log trajectories first (frontend handles this now)
         await self.log(groups_list, split="train")
@@ -657,7 +700,11 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         # 2. Train (backend no longer logs internally)
         training_metrics: list[dict[str, float]] = []
         async for metrics in self.backend()._train_model(
-            self, groups_list, config, _config, verbose
+            self,
+            groups_list,
+            config,
+            _config,  # ty:ignore[invalid-argument-type]
+            verbose,
         ):
             training_metrics.append(metrics)
 

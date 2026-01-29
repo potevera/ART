@@ -40,6 +40,8 @@ class Trajectory(pydantic.BaseModel):
     tools: Tools | None = None
     additional_histories: list[History] = []
     reward: float
+    initial_policy_version: int | None = None
+    final_policy_version: int | None = None
     metrics: dict[str, float | int | bool] = {}
     auto_metrics: dict[str, float | int | bool] = {}
     metadata: dict[str, MetadataValue] = {}
@@ -78,6 +80,8 @@ class Trajectory(pydantic.BaseModel):
     def for_logging(self) -> dict[str, Any]:
         loggable_dict = {
             "reward": self.reward,
+            "initial_policy_version": self.initial_policy_version,
+            "final_policy_version": self.final_policy_version,
             "metrics": self.metrics,
             "metadata": self.metadata,
             "messages": [],
@@ -87,9 +91,9 @@ class Trajectory(pydantic.BaseModel):
         for message_or_choice in self.messages_and_choices:
             trainable = isinstance(message_or_choice, Choice)
             message = (
-                message_or_choice.message.to_dict() if trainable else message_or_choice
+                message_or_choice.message.to_dict() if trainable else message_or_choice  # ty:ignore[possibly-missing-attribute]
             )
-            loggable_dict["messages"].append({**message, "trainable": trainable})
+            loggable_dict["messages"].append({**message, "trainable": trainable})  # ty:ignore[invalid-argument-type, possibly-missing-attribute]
         return loggable_dict
 
 
@@ -112,7 +116,7 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
                         }
                         if tool_calls
                         else {}
-                    ),  # type: ignore
+                    ),
                 }
             )
         else:
