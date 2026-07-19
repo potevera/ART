@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import openai
 
 import art
-from art.local import LocalBackend
+from art.tinker import TinkerBackend
 
 
 async def rollout(client: openai.AsyncOpenAI, prompt: str) -> art.Trajectory:
@@ -17,7 +17,7 @@ async def rollout(client: openai.AsyncOpenAI, prompt: str) -> art.Trajectory:
         }
     ]
     chat_completion = await client.chat.completions.create(
-        messages=messages, model=model.name, max_tokens=100, timeout=100
+        messages=messages, model=model.get_inference_name(), max_tokens=100, timeout=100
     )
     choice = chat_completion.choices[0]
     content = choice.message.content
@@ -40,19 +40,18 @@ def with_quotes(w: str) -> str:
 async def main():
     load_dotenv()
 
-    backend = art.TinkerBackend()
+    backend = TinkerBackend()
     global model
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    run_name = os.environ.get("MODEL_NAME", "012")
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", "012"),
+        name=run_name,
+        run_name=run_name,
         project="yes-no-maybe",
         base_model=base_model,
         # _internal_config=art.dev.InternalModelConfig(
         #     # engine_args=art.dev.EngineArgs(
         #     #     max_lora_rank=1,
-        #     # ),
-        #     # peft_args=art.dev.PeftArgs(
-        #     #     r=1,
         #     # ),
         #     tinker_args=art.dev.TinkerArgs(
         #         renderer_name="qwen3_instruct",

@@ -1,8 +1,22 @@
 from enum import Enum
+from typing import Literal, NoReturn
 
 from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
+
+RolloutWeightsMode = Literal["lora", "merged"]
+RolloutWeightUpdateMode = Literal["step_lora", "in_flight_lora"]
+VllmRuntimeMode = Literal["managed", "external"]
+
+
+class VllmRuntimeArgs(TypedDict, total=False):
+    mode: Required[VllmRuntimeMode]
+    server_url: str
+    api_key: str | None
+    local_checkpoint_root: str | None
+    server_checkpoint_root: str | None
+    health_timeout_s: float
 
 
 # Vendored from transformers.training_args.OptimizerNames
@@ -112,17 +126,57 @@ class InternalModelConfig(TypedDict, total=False):
     Args:
         init: Arguments for initializing an Unsloth FastLanguageModel.
         engine: Arguments for the vLLM engine.
-        peft: Arguments for creating an Unsloth PEFT model wrapper.
         tinker: Arguments for the Tinker training client.
         trainer: Arguments for the GRPO trainer.
+        trainer_gpu_ids: GPU IDs for training (e.g., [0]). When set with
+            inference_gpu_ids, enables dedicated mode where training and
+            inference run on separate GPUs.
+        inference_gpu_ids: GPU IDs for vLLM inference (e.g., [1]). When set
+            with trainer_gpu_ids, enables dedicated mode.
+        rollout_weights_mode: How inference weights are applied in vLLM.
+            - "lora": load LoRA adapters into vLLM directly
+            - "merged": keep training LoRA adapters, but push merged weights
+              into vLLM for inference
+        rollout_weight_update_mode: How LoRA rollout weights are registered
+            when rollout_weights_mode is "lora".
+            - "step_lora": load one adapter per policy step
+            - "in_flight_lora": update one derived LoRA slot in place while
+              recording token-level policy spans
+        chat_template_kwargs: Extra keyword arguments passed to chat-template
+            rendering for both rollout inference and local training tokenization.
+        chat_template: Raw chat template text used by rollout inference and
+            local training tokenization.
+        chat_template_path: Path to a chat template file used by rollout
+            inference and local training tokenization.
+        chat_template_content_format: vLLM chat template content format.
+        chat_template_tool_schema_format: Tool schema rendering format used for
+            local training tokenization.
+        vllm_runtime: vLLM runtime location. Omit for ART-managed local runtime;
+            set mode="external" to attach to a pre-launched vLLM server.
+        allow_unvalidated_arch: Permit model-support validation workflows to run
+            architectures that are not yet in the supported-model registry.
     """
 
     init_args: "InitArgs"
     engine_args: "EngineArgs"
-    peft_args: "PeftArgs"
     tinker_args: "TinkerArgs | None"
     tinker_native_args: "TinkerNativeArgs | None"
     trainer_args: "TrainerArgs"
+    trainer_gpu_ids: list[int]
+    inference_gpu_ids: list[int]
+    rollout_weights_mode: "RolloutWeightsMode"
+    rollout_weight_update_mode: "RolloutWeightUpdateMode"
+    chat_template_kwargs: dict[str, object]
+    chat_template: str
+    chat_template_path: str
+    chat_template_content_format: str
+    chat_template_tool_schema_format: Literal["default", "vllm_openai"]
+    vllm_runtime: VllmRuntimeArgs
+    allow_unvalidated_arch: bool
+
+
+class BackendModelConfig(InternalModelConfig, total=False):
+    lora_config: "LoRAConfig"
 
 
 class TinkerArgs(TypedDict, total=False):
@@ -150,6 +204,7 @@ class InitArgs(TypedDict, total=False):
     dtype: str | None
     load_in_4bit: bool
     load_in_8bit: bool
+    load_in_16bit: bool
     full_finetuning: bool
     token: str | None
     device_map: str
@@ -170,11 +225,11 @@ class InitArgs(TypedDict, total=False):
     use_async: bool
 
 
-class PeftArgs(TypedDict, total=False):
-    r: int
+class LoRAConfig(TypedDict, total=False):
+    rank: int
     target_modules: list[str]
-    lora_alpha: int
-    lora_dropout: int
+    alpha: int
+    dropout: float
     bias: str
     layers_to_transform: list[int] | None
     layers_pattern: str | None
@@ -183,9 +238,16 @@ class PeftArgs(TypedDict, total=False):
     max_seq_length: int
     use_rslora: bool
     modules_to_save: list[str] | None
-    init_lora_weights: bool
+    init_weights: bool
     loftq_config: dict
     temporary_location: str
+
+
+PEFT_ARGS_MIGRATION_MESSAGE = "`peft_args` has been replaced by top-level `TrainableModel(lora_config=...)`. Rename keys: r->rank, lora_alpha->alpha, lora_dropout->dropout, init_lora_weights->init_weights. Keep these keys under lora_config: target_modules, bias, layers_to_transform, layers_pattern, use_gradient_checkpointing, random_state, max_seq_length, use_rslora, modules_to_save, loftq_config, temporary_location."
+
+
+def PeftArgs(*_: object, **__: object) -> NoReturn:
+    raise ValueError(PEFT_ARGS_MIGRATION_MESSAGE)
 
 
 class TrainerArgs(TypedDict, total=False):

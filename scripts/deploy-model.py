@@ -18,9 +18,7 @@ load_dotenv()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Deploy a model checkpoint using ART & SkyPilot"
-    )
+    parser = argparse.ArgumentParser(description="Deploy a model checkpoint using ART")
 
     parser.add_argument("--project", required=True, help="ART project name")
     parser.add_argument("--model", required=True, help="Name of the model to deploy")
@@ -55,6 +53,7 @@ async def deploy() -> None:
     backup_bucket = args.backup_bucket or os.environ["BACKUP_BUCKET"]
 
     model = art.TrainableModel(
+        run_name=args.model,
         name=args.model,
         project=args.project,
         base_model=args.base_model,

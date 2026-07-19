@@ -52,6 +52,7 @@ async def main():
     max_tokens = 1000
     temperature = 1.0
     model = art.TrainableModel(
+        run_name="benchmark-qwen2.5-14b-instruct",
         name="benchmark-qwen2.5-14b-instruct",
         project="benchmark-vllm",
         base_model="Qwen/Qwen2.5-14B-Instruct",
@@ -77,7 +78,13 @@ async def main():
         iteration_start = time.perf_counter()
         # launch concurrent requests and time each individually
         tasks = [
-            timed_request(client, model.name, prompt, max_tokens, temperature)
+            timed_request(
+                client,
+                model.get_inference_name(),
+                prompt,
+                max_tokens,
+                temperature,
+            )
             for _ in range(concurrency)
         ]
         # Wait for all responses

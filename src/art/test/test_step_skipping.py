@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --with skypilot[runpod] sky launch --cluster=kyle-tss --gpus=H100-SXM:1 --yes --retry-until-up --down --fast --idle-minutes-to-autostop=20 --workdir=. --env-file=.env -- uv run src/art/test/test_step_skipping.py
+#!/usr/bin/env -S uv run
 # /// script
 # dependencies = [
 #     "openpipe-art[backend]",
@@ -14,7 +14,6 @@ import tempfile
 import uuid
 
 from art import TrainableModel, Trajectory, TrajectoryGroup
-from art.dev import TrainConfig as DevTrainConfig
 from art.local import LocalBackend
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 
@@ -33,8 +32,6 @@ BASE_TRAJECTORY = Trajectory(
     reward=1.0,
 )
 
-train_config = DevTrainConfig(allow_training_without_logprobs=True)
-
 
 async def test_step_skipping():
     """Test that step counting works correctly when training is skipped."""
@@ -44,10 +41,12 @@ async def test_step_skipping():
         # Set up backend with custom art path
         art_path = os.path.join(tmpdir, ".art")
 
-        with LocalBackend(path=art_path) as backend:
+        async with LocalBackend(path=art_path) as backend:
             # Create a test model
+            run_name = f"test-step-skip-{uuid.uuid4()}"
             model = TrainableModel(
-                name=f"test-step-skip-{uuid.uuid4()}",
+                name=run_name,
+                run_name=run_name,
                 project="test-project",
                 base_model="Qwen/Qwen2.5-0.5B-Instruct",  # Small model for testing
             )
@@ -115,9 +114,10 @@ async def test_step_skipping():
                 ]
             )
 
-            await model.train(
+            await backend.train(
+                model,
                 [group1, group2, group3, group4, group5],
-                _config=train_config,
+                allow_training_without_logprobs=True,
                 verbose=True,
             )
 
@@ -161,9 +161,10 @@ async def test_step_skipping():
                 ]
             )
 
-            await model.train(
+            await backend.train(
+                model,
                 [group1_skip, group2_skip, group3_skip],
-                _config=train_config,
+                allow_training_without_logprobs=True,
                 verbose=True,
             )
 
@@ -225,9 +226,10 @@ async def test_step_skipping():
                 ]
             )
 
-            await model.train(
+            await backend.train(
+                model,
                 [group1_final, group2_final, group3_final, group4_final],
-                _config=train_config,
+                allow_training_without_logprobs=True,
                 verbose=True,
             )
 

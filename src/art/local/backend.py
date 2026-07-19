@@ -1,21 +1,45 @@
+from __future__ import annotations
+
+from array import array
 import asyncio
+from contextlib import asynccontextmanager
+import gc
+import hashlib
 import json
+import logging
 import math
 import os
-import subprocess
+import shutil
+import socket
+import time
 from types import TracebackType
-from typing import AsyncIterator, Iterable, Literal, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
-import aiohttp
+from art.utils.lifecycle import (
+    PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+    process_shutdown_timeout,
+)
+
+logger = logging.getLogger(__name__)
+_SERVICE_CLOSE_TIMEOUT_SECONDS = PROCESS_SHUTDOWN_TIMEOUT_SECONDS
+_PROVENANCE_UPDATE_TIMEOUT_SECONDS = process_shutdown_timeout(9)
+
+_AUTO_GPU_HOURLY_PRICING_USD = {
+    "H200": 3.0,
+}
+
+import httpx
 import numpy as np
-from openai import AsyncOpenAI
+import polars as pl
 import torch
 from tqdm import auto as tqdm
-from transformers import AutoImageProcessor, AutoTokenizer
-from transformers.image_processing_utils import BaseImageProcessor
+from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from transformers.image_processing_utils import BaseImageProcessor
 
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -23,34 +47,240 @@ from art.utils.output_dirs import (
     get_output_dir_from_model_properties,
     get_step_checkpoint_dir,
 )
+from art.utils.record_provenance import record_provenance_for_artifact
 from art.utils.s3 import (
     ExcludableOption,
     pull_model_from_s3,
     push_model_to_s3,
 )
+from art.vllm_runtime import (
+    get_external_vllm_runtime_config,
+    openai_base_url_from_vllm_server_url,
+)
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
-from ..backend import Backend
+from .._backend_training import (
+    aggregate_rl_training_metrics,
+    build_rl_train_configs,
+)
+from ..backend import AnyTrainableModel
+from ..dev.sequence_lengths import max_seq_length_from_model_config
+from ..errors import ArtVllmMetricsTimeoutError
+from ..metrics_taxonomy import (
+    TRAIN_GRADIENT_STEPS_KEY,
+    build_training_summary_metrics,
+    summarize_trajectory_groups,
+)
 from ..model import Model, TrainableModel
+from ..pipeline_tuner import (
+    PackedGroupShape,
+    PackingLeafShape,
+)
 from ..preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_tokenized_results,
     packed_tensors_to_dir,
     plot_packed_tensors,
+    prefix_tree_shareable_length,
 )
-from ..preprocessing.tokenize import tokenize_trajectory_groups
+from ..preprocessing.tokenize import (
+    ChatTemplateToolSchemaFormat,
+    tokenize_sft_batch,
+    tokenize_trajectory_groups,
+)
+from ..serving_capabilities import ServingCapabilities
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import LocalTrainResult, Message, TrainConfig
+from ..types import (
+    Choice,
+    LocalTrainResult,
+    Message,
+    TrainConfig,
+    TrainSFTConfig,
+)
 from ..utils import format_message, get_model_step
+from .adapter_leases import (
+    AdapterLeaseManager,
+    in_flight_lora_name,
+    pin_inference_step,
+    pin_inference_target,
+    pinned_inference_name,
+    pinned_inference_step,
+)
 from .checkpoints import (
     delete_checkpoints,
 )
 from .service import ModelService
 
 
-class LocalBackend(Backend):
-    def __init__(self, *, in_process: bool = False, path: str | None = None) -> None:
+def _prometheus_values(text: str, name: str) -> list[float]:
+    values: list[float] = []
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        try:
+            sample, raw_value = line.rsplit(None, 1)
+        except ValueError:
+            continue
+        sample_name = sample.split("{", 1)[0]
+        if sample_name != name:
+            continue
+        try:
+            values.append(float(raw_value))
+        except ValueError:
+            continue
+    return values
+
+
+def _prometheus_sum(text: str, name: str) -> float | None:
+    values = _prometheus_values(text, name)
+    if not values:
+        return None
+    return math.fsum(values)
+
+
+def _prometheus_sum_with_label(
+    text: str, name: str, label: str, value: str
+) -> float | None:
+    values: list[float] = []
+    needle = f'{label}="{value}"'
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        try:
+            sample, raw_value = line.rsplit(None, 1)
+        except ValueError:
+            continue
+        sample_name = sample.split("{", 1)[0]
+        if sample_name != name or needle not in sample:
+            continue
+        try:
+            values.append(float(raw_value))
+        except ValueError:
+            continue
+    return math.fsum(values) if values else None
+
+
+def _prometheus_mean(text: str, name: str) -> float | None:
+    values = _prometheus_values(text, name)
+    if not values:
+        return None
+    return math.fsum(values) / len(values)
+
+
+def _configured_chat_template_value(
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    chat_template = internal_config.get("chat_template")
+    chat_template_path = internal_config.get("chat_template_path")
+    if chat_template is not None and chat_template_path is not None:
+        raise ValueError("Set only one of chat_template or chat_template_path.")
+    if chat_template_path is not None:
+        with open(chat_template_path, encoding="utf-8") as handle:
+            return handle.read()
+    return chat_template
+
+
+def _configured_chat_template_server_arg(
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    chat_template = internal_config.get("chat_template")
+    chat_template_path = internal_config.get("chat_template_path")
+    if chat_template is not None and chat_template_path is not None:
+        raise ValueError("Set only one of chat_template or chat_template_path.")
+    return chat_template_path or chat_template
+
+
+def _model_support_default_chat_template(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> str | None:
+    handler = _model_support_handler(base_model, internal_config)
+    if handler is None:
+        return None
+    return handler.default_chat_template()
+
+
+def _apply_configured_chat_template(
+    tokenizer: PreTrainedTokenizerBase,
+    internal_config: dev.InternalModelConfig,
+) -> None:
+    chat_template = _configured_chat_template_value(internal_config)
+    if chat_template is not None:
+        tokenizer.chat_template = chat_template
+
+
+def _model_support_handler(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> Any | None:
+    from ..megatron.model_support.registry import (
+        UnsupportedModelArchitectureError,
+        get_model_support_handler,
+    )
+
+    try:
+        return get_model_support_handler(
+            base_model,
+            allow_unvalidated_arch=bool(
+                internal_config.get("allow_unvalidated_arch", False)
+            ),
+        )
+    except UnsupportedModelArchitectureError:
+        return None
+
+
+def _apply_configured_chat_template_server_args(
+    config_dict: dict,
+    internal_config: dev.InternalModelConfig,
+    *,
+    base_model: str | None = None,
+) -> None:
+    chat_template = _configured_chat_template_server_arg(internal_config)
+    if chat_template is None and base_model is not None:
+        chat_template = _model_support_default_chat_template(
+            base_model, internal_config
+        )
+    if chat_template is None:
+        return
+    server_args = dict(config_dict.get("server_args", {}))
+    server_args.setdefault("chat_template", chat_template)
+    if chat_template_content_format := internal_config.get(
+        "chat_template_content_format"
+    ):
+        server_args.setdefault(
+            "chat_template_content_format",
+            chat_template_content_format,
+        )
+    config_dict["server_args"] = server_args
+
+
+def _tokenizer_cache_key(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> tuple[str, str | None]:
+    chat_template = _configured_chat_template_value(internal_config)
+    if chat_template is None:
+        return (base_model, None)
+    return (base_model, hashlib.sha256(chat_template.encode("utf-8")).hexdigest())
+
+
+def _load_training_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
+    return cast(
+        PreTrainedTokenizerBase,
+        AutoTokenizer.from_pretrained(base_model),
+    )
+
+
+class LocalBackend:
+    def __init__(
+        self,
+        *,
+        in_process: bool = False,
+        path: str | None = None,
+        gpu_cost_per_hour_usd: float | None = None,
+        enable_expert_replay: bool = True,
+    ) -> None:
         """
         Initializes a local, directory-based Backend interface at the given path.
 
@@ -61,17 +291,317 @@ class LocalBackend(Backend):
         Args:
             in_process: Whether to run the local service in-process.
             path: The path to the local directory. Defaults to "{repo_root}/.art".
+            gpu_cost_per_hour_usd: Optional per-GPU hourly price override used for
+                automatic `costs/gpu` accounting on train steps. When unset,
+                ART auto-detects supported GPU types (H200 at $3/hr today) and
+                skips GPU cost logging for unknown devices instead of guessing.
+            enable_expert_replay: For supported MoE Megatron training, capture
+                vLLM routed experts and replay them in Megatron. Defaults to True.
         """
         self._in_process = in_process
         self._path = path or get_default_art_path()
+        self._gpu_cost_per_hour_usd = (
+            float(gpu_cost_per_hour_usd) if gpu_cost_per_hour_usd is not None else None
+        )
+        self._enable_expert_replay = enable_expert_replay
         os.makedirs(self._path, exist_ok=True)
 
         # Other initialization
-        self._services: dict[str, ModelService] = {}
-        self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
+        self._services: dict[tuple[str, str], ModelService] = {}
+        self._adapter_leases: dict[tuple[str, str], AdapterLeaseManager] = {}
+        self._tokenizers: dict[tuple[str, str | None], PreTrainedTokenizerBase] = {}
+        self._model_max_sequence_lengths: dict[
+            tuple[str, str | None, str | None], int
+        ] = {}
+        self._grad_accumulation_sequences_by_service: dict[int, int] = {}
+        self._provenance_update_tasks: set[asyncio.Task[None]] = set()
+        self._vllm_metric_snapshots: dict[
+            tuple[str, str], tuple[float, dict[str, float]]
+        ] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
+        self._requires_explicit_packed_sequence_length = False
+        self._packed_sequence_length_requires_chunk_alignment = True
+        self._supports_result_packing = False
+        self._default_chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = (
+            "default"
+        )
+
+    @staticmethod
+    def _model_storage_key(model: Model) -> tuple[str, str]:
+        return model.project, model._storage_name()
+
+    def _model_uses_expert_replay(self, model: AnyTrainableModel) -> bool:
+        if not self._enable_expert_replay or not self._supports_result_packing:
+            return False
+        from ..megatron.model_support.registry import (
+            UnsupportedModelArchitectureError,
+            model_uses_expert_parallel,
+        )
+
+        allow_unvalidated_arch = bool(
+            (model._internal_config or dev.InternalModelConfig()).get(
+                "allow_unvalidated_arch", False
+            )
+        )
+        try:
+            return model_uses_expert_parallel(
+                model.base_model,
+                allow_unvalidated_arch=allow_unvalidated_arch,
+            )
+        except UnsupportedModelArchitectureError:
+            return False
+
+    def _model_max_sequence_length(self, model: AnyTrainableModel) -> int:
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        configured = internal_config.get("init_args", {}).get("max_seq_length")
+        if configured is not None:
+            return int(configured)
+        init_args = internal_config.get("init_args", {})
+        cache_key = (
+            model.base_model,
+            init_args.get("revision"),
+            init_args.get("token"),
+        )
+        if cache_key not in self._model_max_sequence_lengths:
+            self._model_max_sequence_lengths[cache_key] = (
+                max_seq_length_from_model_config(
+                    model.base_model,
+                    revision=cache_key[1],
+                    token=cache_key[2],
+                )
+            )
+        return self._model_max_sequence_lengths[cache_key]
+
+    def supports_automatic_train_step_metrics(self) -> bool:
+        return True
+
+    def automatic_gpu_cost_per_hour_usd(self, model: Model) -> float | None:
+        per_gpu_cost = self._resolve_gpu_cost_per_hour_usd()
+        if per_gpu_cost is None:
+            return None
+
+        gpu_count = self._allocated_gpu_count(model)
+        if gpu_count <= 0:
+            return None
+        return per_gpu_cost * gpu_count
+
+    async def collect_train_step_vllm_metrics(self, model: Model) -> dict[str, float]:
+        capabilities = model._serving_capabilities
+        if capabilities is None:
+            raise RuntimeError("vLLM serving capabilities have not been discovered")
+        capabilities.require("fast_metrics", operation="ART vLLM metrics collection")
+        base_url = model.inference_base_url
+        if not base_url or not base_url.startswith(("http://", "https://")):
+            raise RuntimeError(
+                "ART vLLM metrics require model.inference_base_url to point to the "
+                "dedicated ART vLLM runtime."
+            )
+
+        metrics_root = base_url.rstrip("/")
+        if metrics_root.endswith("/v1"):
+            metrics_root = metrics_root[: -len("/v1")]
+        headers = (
+            {"Authorization": f"Bearer {model.inference_api_key}"}
+            if model.inference_api_key
+            else None
+        )
+        try:
+            async with httpx.AsyncClient(timeout=1.0) as client:
+                response = await client.get(
+                    f"{metrics_root}/art/metrics",
+                    headers=headers,
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.TimeoutException:
+            raise ArtVllmMetricsTimeoutError(
+                f"Timed out collecting ART vLLM metrics from {metrics_root}."
+            )
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RuntimeError(
+                "ART vLLM metrics require the dedicated ART runtime endpoint at "
+                f"{metrics_root}/art/metrics."
+            ) from exc
+
+        raw_metrics = payload.get("metrics") if isinstance(payload, dict) else None
+        if not isinstance(raw_metrics, dict):
+            raise RuntimeError(
+                "ART vLLM metrics endpoint returned an invalid payload: expected "
+                "a top-level metrics object."
+            )
+
+        def required_metric(name: str) -> float:
+            raw_value = raw_metrics.get(name)
+            if not isinstance(raw_value, (int, float)):
+                raise RuntimeError(
+                    f"ART vLLM metrics endpoint did not provide numeric {name!r}."
+                )
+            return float(raw_value)
+
+        def optional_metric(name: str) -> float | None:
+            raw_value = raw_metrics.get(name)
+            if not isinstance(raw_value, (int, float)):
+                return None
+            return float(raw_value)
+
+        snapshot = {
+            "prompt_tokens_total": required_metric("prompt_tokens_total"),
+            "generation_tokens_total": required_metric("generation_tokens_total"),
+            "prefix_cache_queries_total": required_metric("prefix_cache_queries_total"),
+            "prefix_cache_hits_total": required_metric("prefix_cache_hits_total"),
+            "num_preemptions_total": required_metric("num_preempted_reqs_total"),
+        }
+        metrics: dict[str, float] = {}
+        gauges = {
+            "vllm/num_requests_running": required_metric("num_requests_running"),
+            "vllm/num_requests_waiting": required_metric("num_requests_waiting"),
+            "vllm/num_requests_waiting_capacity": required_metric(
+                "num_requests_waiting_capacity"
+            ),
+            "vllm/kv_cache_usage_perc": required_metric("kv_cache_usage_perc"),
+            "vllm/num_preemptions_total": snapshot["num_preemptions_total"],
+        }
+        for key, value in gauges.items():
+            if value is not None:
+                metrics[key] = value
+        for name in (
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "max_num_scheduled_tokens",
+            "max_model_len",
+            "world_size",
+        ):
+            value = optional_metric(name)
+            if value is not None:
+                metrics[f"vllm/{name}"] = value
+
+        now = time.monotonic()
+        storage_key = self._model_storage_key(model)
+        previous = self._vllm_metric_snapshots.get(storage_key)
+        if previous is not None:
+            previous_time, previous_snapshot = previous
+            elapsed = max(0.0, now - previous_time)
+            if elapsed > 0:
+                prompt_tokens = snapshot["prompt_tokens_total"]
+                previous_prompt_tokens = previous_snapshot.get("prompt_tokens_total")
+                if prompt_tokens is not None and previous_prompt_tokens is not None:
+                    metrics["vllm/prompt_tok_per_s"] = max(
+                        0.0, (prompt_tokens - previous_prompt_tokens) / elapsed
+                    )
+                generation_tokens = snapshot["generation_tokens_total"]
+                previous_generation_tokens = previous_snapshot.get(
+                    "generation_tokens_total"
+                )
+                if (
+                    generation_tokens is not None
+                    and previous_generation_tokens is not None
+                ):
+                    metrics["vllm/completion_tok_per_s"] = max(
+                        0.0, (generation_tokens - previous_generation_tokens) / elapsed
+                    )
+
+            prefix_queries = snapshot["prefix_cache_queries_total"]
+            previous_prefix_queries = previous_snapshot.get(
+                "prefix_cache_queries_total"
+            )
+            prefix_hits = snapshot["prefix_cache_hits_total"]
+            previous_prefix_hits = previous_snapshot.get("prefix_cache_hits_total")
+            if (
+                prefix_queries is not None
+                and previous_prefix_queries is not None
+                and prefix_hits is not None
+                and previous_prefix_hits is not None
+            ):
+                delta_queries = prefix_queries - previous_prefix_queries
+                if delta_queries > 0:
+                    metrics["vllm/prefix_cache_hit_rate"] = max(
+                        0.0,
+                        min(1.0, (prefix_hits - previous_prefix_hits) / delta_queries),
+                    )
+        elif (
+            snapshot["prefix_cache_queries_total"] is not None
+            and snapshot["prefix_cache_hits_total"] is not None
+            and snapshot["prefix_cache_queries_total"] > 0
+        ):
+            metrics["vllm/prefix_cache_hit_rate"] = max(
+                0.0,
+                min(
+                    1.0,
+                    snapshot["prefix_cache_hits_total"]
+                    / snapshot["prefix_cache_queries_total"],
+                ),
+            )
+
+        self._vllm_metric_snapshots[storage_key] = (
+            now,
+            {key: value for key, value in snapshot.items() if value is not None},
+        )
+        return metrics
+
+    def _resolve_gpu_cost_per_hour_usd(self) -> float | None:
+        if self._gpu_cost_per_hour_usd is not None:
+            return self._gpu_cost_per_hour_usd
+        if not torch.cuda.is_available():
+            return None
+
+        num_visible_gpus = torch.cuda.device_count()
+        if num_visible_gpus <= 0:
+            return None
+
+        resolved_costs: list[float] = []
+        for index in range(num_visible_gpus):
+            device_name = torch.cuda.get_device_name(index).upper()
+            for gpu_name, hourly_cost in _AUTO_GPU_HOURLY_PRICING_USD.items():
+                if gpu_name in device_name:
+                    resolved_costs.append(hourly_cost)
+                    break
+            else:
+                return None
+
+        if not resolved_costs:
+            return None
+        if len(set(resolved_costs)) != 1:
+            return None
+        return resolved_costs[0]
+
+    def _allocated_gpu_count(self, model: Model) -> int:
+        if isinstance(model, TrainableModel) and model._internal_config is not None:
+            trainer_gpu_ids = set(model._internal_config.get("trainer_gpu_ids", []))
+            inference_gpu_ids = set(model._internal_config.get("inference_gpu_ids", []))
+            allocated_gpu_ids = trainer_gpu_ids | inference_gpu_ids
+            if allocated_gpu_ids:
+                return len(allocated_gpu_ids)
+
+        if not torch.cuda.is_available():
+            return 0
+        return torch.cuda.device_count()
+
+    def _chat_template_tool_schema_format(
+        self,
+        internal_config: dev.InternalModelConfig,
+    ) -> ChatTemplateToolSchemaFormat:
+        return internal_config.get(
+            "chat_template_tool_schema_format",
+            self._default_chat_template_tool_schema_format,
+        )
+
+    def _configure_training_tokenizer(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        model: AnyTrainableModel,
+        internal_config: dev.InternalModelConfig,
+    ) -> PreTrainedTokenizerBase:
+        _apply_configured_chat_template(tokenizer, internal_config)
+        handler = _model_support_handler(model.base_model, internal_config)
+        if handler is None:
+            return tokenizer
+        return handler.configure_tokenizer(tokenizer, internal_config=internal_config)
 
     def __enter__(self) -> Self:
+        return self
+
+    async def __aenter__(self) -> Self:
         return self
 
     def __exit__(
@@ -82,15 +612,98 @@ class LocalBackend(Backend):
     ) -> None:
         self._close()
 
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.close()
+
     async def close(self) -> None:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
-        self._close()
+        for service in self._services.values():
+            try:
+                aclose = getattr(service, "aclose", None)
+                if aclose is None:
+                    close = getattr(service, "close", None)
+                    if close is not None:
+                        close()
+                else:
+                    await asyncio.wait_for(
+                        aclose(), timeout=_SERVICE_CLOSE_TIMEOUT_SECONDS
+                    )
+            except TimeoutError:
+                logger.warning("Timed out while closing local backend service.")
+            except Exception:
+                logger.exception("Failed to close local backend service.")
+            finally:
+                try:
+                    close_proxy(service)
+                except Exception:
+                    logger.exception("Failed to close local backend service proxy.")
+        self._services.clear()
+        self._adapter_leases.clear()
+        await self._drain_provenance_update_tasks()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     def _close(self) -> None:
-        for _, service in self._services.items():
-            close_proxy(service)
+        self._cancel_provenance_update_tasks()
+        for service in self._services.values():
+            try:
+                close = getattr(service, "close", None)
+                if close is not None:
+                    close()
+            except Exception:
+                logger.exception("Failed to close local backend service.")
+            finally:
+                try:
+                    close_proxy(service)
+                except Exception:
+                    logger.exception("Failed to close local backend service proxy.")
+        self._services.clear()
+        self._adapter_leases.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+    async def _drain_provenance_update_tasks(self) -> None:
+        if not self._provenance_update_tasks:
+            return
+        tasks = set(self._provenance_update_tasks)
+        done, pending = await asyncio.wait(
+            tasks, timeout=_PROVENANCE_UPDATE_TIMEOUT_SECONDS
+        )
+        for task in pending:
+            task.cancel()
+        cancelled_done: set[asyncio.Task[Any]] = set()
+        if pending:
+            cancelled_done, pending = await asyncio.wait(
+                pending, timeout=_PROVENANCE_UPDATE_TIMEOUT_SECONDS
+            )
+            if pending:
+                logger.debug(
+                    "Timed out waiting for cancelled W&B provenance tasks to finish."
+                )
+        for task in done | cancelled_done:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("Failed to record W&B provenance", exc_info=True)
+        self._provenance_update_tasks.difference_update(tasks)
+
+    def _cancel_provenance_update_tasks(self) -> None:
+        for task in tuple(self._provenance_update_tasks):
+            task.cancel()
+        self._provenance_update_tasks.clear()
 
     async def register(
         self,
@@ -131,20 +744,145 @@ class LocalBackend(Backend):
                   If None, returns name for latest checkpoint (step 0 initially).
         """
 
-        # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
-        # Default to step 0 when not specified (the initial checkpoint created at registration)
-        actual_step = step if step is not None else self.__get_step(model)
-        return f"{model.name}@{actual_step}"
+        requested_step = step
+        if exact_name := pinned_inference_name(model.name, step):
+            return exact_name
+
+        in_flight_lora = (
+            isinstance(model, TrainableModel)
+            and (model._internal_config or {}).get("rollout_weight_update_mode")
+            == "in_flight_lora"
+        )
+        if in_flight_lora:
+            if step is not None:
+                raise ValueError(
+                    "In-flight LoRA serving cannot address an immutable policy step. "
+                    "Use exact_adapter_lease() for exact checkpoint inference."
+                )
+            return in_flight_lora_name(model.name)
+
+        if step is None:
+            step = pinned_inference_step(model.name)
+
+        if step is None and isinstance(model, TrainableModel):
+            from ..dev.validate import is_dedicated_mode
+
+            service = self._services.get(self._model_storage_key(model))
+            if service is not None and is_dedicated_mode(
+                model._internal_config or dev.InternalModelConfig()
+            ):
+                loaded_step = getattr(service, "_latest_step", None)
+                if isinstance(loaded_step, int):
+                    step = loaded_step
+
+        if step is None:
+            # The checkpoint directory is written before dedicated-mode
+            # vLLM finishes reloading the new adapter.
+            step = self.__get_step(model)
+        name = f"{model.name}@{step}"
+        logger.debug(
+            f"[BACKEND] _model_inference_name: step_arg={requested_step} "
+            f"actual_step={step} -> {name}"
+        )
+        return name
+
+    def _adapter_lease_manager(self, model: Model) -> AdapterLeaseManager:
+        storage_key = self._model_storage_key(model)
+        manager = self._adapter_leases.get(storage_key)
+        if manager is None:
+            manager = AdapterLeaseManager()
+            self._adapter_leases[storage_key] = manager
+        return manager
+
+    @asynccontextmanager
+    async def adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        manager = self._adapter_lease_manager(model)
+        in_flight_lora = (model._internal_config or {}).get(
+            "rollout_weight_update_mode"
+        ) == "in_flight_lora"
+        lease = (
+            pin_inference_target(
+                model.name,
+                step=step,
+                inference_name=in_flight_lora_name(model.name),
+            )
+            if in_flight_lora
+            else pin_inference_step(model.name, step)
+        )
+        async with lease, manager.lease(step):
+            yield
+
+    @asynccontextmanager
+    async def exact_adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        service = await self._get_service(model)
+        checkpoint_path = get_step_checkpoint_dir(
+            get_model_dir(model=model, art_path=self._path), step
+        )
+        inference_name = await service.acquire_exact_adapter(step, checkpoint_path)
+        manager = self._adapter_lease_manager(model)
+        try:
+            async with (
+                pin_inference_target(
+                    model.name,
+                    step=step,
+                    inference_name=inference_name,
+                ),
+                manager.lease(step),
+            ):
+                yield
+        finally:
+            await service.release_exact_adapter(step)
+
+    @asynccontextmanager
+    async def adapter_retention_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        manager = self._adapter_lease_manager(model)
+        async with manager.lease(step):
+            yield
+
+    async def prune_model_adapters(
+        self,
+        model: AnyTrainableModel,
+        *,
+        retain_steps: set[int],
+    ) -> None:
+        storage_key = self._model_storage_key(model)
+        service = self._services.get(storage_key)
+        if service is None:
+            return
+        manager = self._adapter_leases.get(storage_key)
+        if manager is not None:
+            retain_steps = set(retain_steps) | manager.active_steps()
+        prune_loaded_adapters = getattr(service, "prune_loaded_adapters", None)
+        if prune_loaded_adapters is not None:
+            await prune_loaded_adapters(retain_steps=retain_steps)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
+        from ..dev.validate import is_dedicated_mode, validate_dedicated_config
 
-        if model.name not in self._services:
+        storage_key = self._model_storage_key(model)
+        if storage_key not in self._services:
             config = get_model_config(
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
+                lora_config=model.lora_config,
             )
+            validate_dedicated_config(config)
+            dedicated = is_dedicated_mode(config)
+
             is_tinker = config.get("tinker_args") is not None
             if is_tinker:
                 from ..tinker.service import TinkerService
@@ -157,42 +895,60 @@ class LocalBackend(Backend):
                 # When moving the service to a child process, import unsloth
                 # early to maximize optimizations
                 os.environ["IMPORT_UNSLOTH"] = "1"
-            self._services[model.name] = service_class(
+
+            if dedicated:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                    str(g) for g in config["trainer_gpu_ids"]
+                )
+
+            self._services[storage_key] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
-            if not self._in_process:
-                # Kill all "model-service" processes to free up GPU memory
-                subprocess.run(["pkill", "-9", "model-service"])
-                self._services[model.name] = move_to_child_process(
-                    self._services[model.name],
+            if not dedicated and not self._in_process:
+                self._services[storage_key] = move_to_child_process(
+                    self._services[storage_key],
                     process_name="tinker-service" if is_tinker else "model-service",
                 )
-        return self._services[model.name]
+        return self._services[storage_key]
 
     def _get_packed_tensors(
         self,
-        model: TrainableModel,
+        model: AnyTrainableModel,
         trajectory_groups: list[TrajectoryGroup],
         advantage_balance: float,
         allow_training_without_logprobs: bool,
         scale_rewards: bool,
         plot_tensors: bool,
+        packed_sequence_length: int | None,
+        logprob_calculation_chunk_size: int,
+        include_moe_routing: bool = False,
     ) -> PackedTensors | None:
-        if model.base_model not in self._tokenizers:
-            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
-                model.base_model
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
+        if tokenizer_key not in self._tokenizers:
+            tokenizer = self._configure_training_tokenizer(
+                _load_training_tokenizer(model.base_model),
+                model=model,
+                internal_config=internal_config,
             )
+            self._tokenizers[tokenizer_key] = tokenizer
         if model.base_model not in self._image_processors:
             try:
+                from transformers import AutoImageProcessor
+
                 self._image_processors[model.base_model] = (
                     AutoImageProcessor.from_pretrained(model.base_model, use_fast=True)
                 )
             except Exception:
                 self._image_processors[model.base_model] = None
-        tokenizer = self._tokenizers[model.base_model]
+        tokenizer = self._tokenizers[tokenizer_key]
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        chat_template_tool_schema_format = self._chat_template_tool_schema_format(
+            internal_config
+        )
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -200,25 +956,88 @@ class LocalBackend(Backend):
                 allow_training_without_logprobs,
                 scale_rewards,
                 image_processor=self._image_processors[model.base_model],
+                chat_template_kwargs=chat_template_kwargs,
+                chat_template_tool_schema_format=chat_template_tool_schema_format,
             )
         )
         if not tokenized_results:
             return None
-        max_tokens = max(len(result.tokens) for result in tokenized_results)
-        # Round up max_tokens to the nearest multiple of 2048
-        sequence_length = math.ceil(max_tokens / 2048) * 2048
-        # Cap sequence length at the model's max sequence length
-        sequence_length = min(
-            sequence_length,
-            (model._internal_config or dev.InternalModelConfig())
-            .get("init_args", {})
-            .get("max_seq_length", 32_768),
-        )
+        model_max_sequence_length = self._model_max_sequence_length(model)
+        too_long_for_model = [
+            result
+            for result in tokenized_results
+            if len(result.token_ids) > model_max_sequence_length
+        ]
+        if too_long_for_model:
+            warnings.warn(
+                "Dropping "
+                f"{len(too_long_for_model)} tokenized results from "
+                f"{len({id(result.trajectory) for result in too_long_for_model})} "
+                f"trajectories longer than model max_seq_length={model_max_sequence_length} "
+                f"(max seen {max(len(result.token_ids) for result in too_long_for_model)}).",
+                stacklevel=2,
+            )
+            tokenized_results = [
+                result
+                for result in tokenized_results
+                if len(result.token_ids) <= model_max_sequence_length
+            ]
+            if not tokenized_results:
+                return None
+        if packed_sequence_length is None:
+            assert not self._requires_explicit_packed_sequence_length, (
+                f"{type(self).__name__} requires packed_sequence_length to be set."
+            )
+            max_tokens = max(len(result.token_ids) for result in tokenized_results)
+            sequence_length = min(
+                math.ceil(max_tokens / 2048) * 2048,
+                model_max_sequence_length,
+            )
+        else:
+            sequence_length = packed_sequence_length
+
+        if (
+            packed_sequence_length is not None
+            and self._packed_sequence_length_requires_chunk_alignment
+            and sequence_length % logprob_calculation_chunk_size != 0
+        ):
+            raise ValueError(
+                f"packed_sequence_length ({sequence_length}) must be divisible by "
+                f"logprob_calculation_chunk_size ({logprob_calculation_chunk_size})"
+            )
+
+        too_long_results = [
+            result
+            for result in tokenized_results
+            if len(result.token_ids) > sequence_length
+        ]
+        if too_long_results:
+            warnings.warn(
+                "Dropping "
+                f"{len(too_long_results)} tokenized results from "
+                f"{len({id(result.trajectory) for result in too_long_results})} "
+                f"trajectories that do not fit packed_sequence_length={sequence_length} "
+                f"(max seen {max(len(result.token_ids) for result in too_long_results)}). "
+                "This affects training, but your model may still learn.",
+                stacklevel=2,
+            )
+            tokenized_results = [
+                result
+                for result in tokenized_results
+                if len(result.token_ids) <= sequence_length
+            ]
+            if not tokenized_results:
+                return None
+
+        self._record_packed_group_observations(trajectory_groups, tokenized_results)
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,
             pad_token_id=tokenizer.eos_token_id,
+            truncate_long_results=False,
             advantage_balance=advantage_balance,
+            pack_results=self._supports_result_packing,
+            include_moe_routing=include_moe_routing,
         )
         if (
             not allow_training_without_logprobs
@@ -238,7 +1057,34 @@ class LocalBackend(Backend):
             )
         return packed_tensors
 
-    async def _get_step(self, model: TrainableModel) -> int:
+    @staticmethod
+    def _record_packed_group_observations(
+        trajectory_groups: list[TrajectoryGroup], tokenized_results: list[Any]
+    ) -> None:
+        if not any(group._collect_packing_shape for group in trajectory_groups):
+            return
+        by_trajectory_id: dict[int, list[Any]] = {}
+        for result in tokenized_results:
+            by_trajectory_id.setdefault(id(result.trajectory), []).append(result)
+        for group in trajectory_groups:
+            if not group._collect_packing_shape:
+                continue
+            results: list[Any] = []
+            for trajectory in group.trajectories:
+                results.extend(by_trajectory_id.get(id(trajectory), []))
+            if not results:
+                continue
+            leaves = []
+            for result in results:
+                leaves.append(
+                    PackingLeafShape(
+                        token_ids=array("I", result.token_ids),
+                        shareable_length=prefix_tree_shareable_length(result),
+                    )
+                )
+            group._packed_group_shape = PackedGroupShape(leaves=tuple(leaves))
+
+    async def _get_step(self, model: AnyTrainableModel) -> int:
         return self.__get_step(model)
 
     def __get_step(self, model: Model) -> int:
@@ -250,107 +1096,84 @@ class LocalBackend(Backend):
 
     async def _delete_checkpoint_files(
         self,
-        model: TrainableModel,
+        model: AnyTrainableModel,
         steps_to_keep: list[int],
     ) -> None:
         """Delete checkpoint files, keeping only the specified steps."""
-        from ..tinker.service import TinkerService
 
         output_dir = get_model_dir(model=model, art_path=self._path)
         service = await self._get_service(model)
-        if isinstance(service, TinkerService):
-            await service.delete_checkpoints(steps_to_keep)
-        else:
-            delete_checkpoints(output_dir, steps_to_keep)
+        try:
+            from ..tinker.service import TinkerService
+
+            if isinstance(service, TinkerService):
+                await service.delete_checkpoints(steps_to_keep)
+                return
+        except ImportError:
+            pass
+        delete_checkpoints(output_dir, steps_to_keep)
 
     async def _prepare_backend_for_training(
         self,
-        model: TrainableModel,
+        model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
+        config_dict: dict = dict(config or {})
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        _apply_configured_chat_template_server_args(config_dict, internal_config)
+        if self._model_uses_expert_replay(model):
+            engine_args = dict(config_dict.get("engine_args", {}))
+            engine_args["enable_return_routed_experts"] = True
+            config_dict["engine_args"] = engine_args
+        server_args = dict(config_dict.get("server_args", {}))
+
+        # Avoid binding collisions on busy hosts when no explicit port is provided.
+        if "port" not in server_args:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", 0))
+                server_args["port"] = s.getsockname()[1]
+        config_dict["server_args"] = server_args
+        resolved_config = cast(dev.OpenAIServerConfig, config_dict)
+
         service = await self._get_service(model)
-        host, port = await service.start_openai_server(config=config)
+        host, port = await service.start_openai_server(config=resolved_config)
+        get_capabilities = getattr(service, "get_serving_capabilities", None)
+        capabilities = await get_capabilities() if callable(get_capabilities) else None
+        if capabilities is not None:
+            if not isinstance(capabilities, ServingCapabilities):
+                raise RuntimeError("Serving service returned invalid capabilities")
+            object.__setattr__(model, "_serving_capabilities", capabilities)
 
-        base_url = f"http://{host}:{port}/v1"
-        api_key = (config or {}).get("server_args", {}).get(
-            "api_key", None
-        ) or "default"
+        external_runtime = get_external_vllm_runtime_config(internal_config)
+        if external_runtime is not None:
+            base_url = openai_base_url_from_vllm_server_url(external_runtime.server_url)
+            api_key = (
+                server_args.get("api_key") or external_runtime.api_key or "default"
+            )
+        else:
+            base_url = f"http://{host}:{port}/v1"
+            api_key = server_args.get("api_key") or "default"
+        object.__setattr__(model, "_inference_connection_errors_are_fatal", True)
 
-        def done_callback(_: asyncio.Task[None]) -> None:
-            close_proxy(self._services.pop(model.name))
-
-        asyncio.create_task(
-            self._monitor_openai_server(model.name, base_url, api_key)
-        ).add_done_callback(done_callback)
+        if self._model_uses_expert_replay(model):
+            if capabilities is None:
+                raise RuntimeError(
+                    "MoE routing replay requires serving capability discovery"
+                )
+            capabilities.require(
+                "binary_routed_experts", operation="MoE routing replay"
+            )
+            if not base_url.rstrip("/").endswith("/v1"):
+                raise RuntimeError(
+                    "ART vLLM base URL must end in /v1 for binary routed experts"
+                )
+            object.__setattr__(
+                model,
+                "_art_binary_routes_base_url",
+                f"{base_url.rstrip('/')[:-3]}/art/v1",
+            )
 
         return base_url, api_key
-
-    async def _monitor_openai_server(
-        self, model_name: str, base_url: str, api_key: str
-    ) -> None:
-        openai_client = AsyncOpenAI(
-            base_url=base_url,
-            api_key=api_key,
-        )
-        consecutive_failures = 0
-        max_consecutive_failures = 3
-        async with aiohttp.ClientSession() as session:
-            while True:
-                # Wait 30 seconds before checking again
-                await asyncio.sleep(30)
-                try:
-                    # If the server is sleeping, skip the check
-                    if await self._services[model_name].vllm_engine_is_sleeping():
-                        consecutive_failures = 0
-                        continue
-                    # Check the metrics with a timeout
-                    async with session.get(
-                        f"{base_url.split('/v1')[0]}/metrics",
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as response:
-                        metrics = await response.text()
-                    # Parse Prometheus metrics for running requests
-                    running_requests = 0
-                    pending_requests = 0
-                    for line in metrics.split("\n"):
-                        if line.startswith("vllm:num_requests_running"):
-                            running_requests = int(float(line.split()[1]))
-                        elif line.startswith("vllm:num_requests_waiting"):
-                            pending_requests = int(float(line.split()[1]))
-                    # If there are no running or pending requests, send a health check
-                    if running_requests == 0 and pending_requests == 0:
-                        try:
-                            # Send a health check with a short timeout
-                            await openai_client.completions.create(
-                                model=model_name,
-                                prompt="Hi",
-                                max_tokens=1,
-                                timeout=float(
-                                    os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
-                                ),
-                            )
-                        except Exception as e:
-                            # If the server is sleeping, a failed health check is okay
-                            if await self._services[
-                                model_name
-                            ].vllm_engine_is_sleeping():
-                                consecutive_failures = 0
-                                continue
-                            raise e
-                    # Reset failure counter on success
-                    consecutive_failures = 0
-                except Exception:
-                    # If the server is sleeping during an exception, it's okay
-                    try:
-                        if await self._services[model_name].vllm_engine_is_sleeping():
-                            consecutive_failures = 0
-                            continue
-                    except Exception:
-                        pass  # If we can't check sleeping status, count it as a failure
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        raise
-                    # Otherwise, continue and try again
 
     # Note: _log() method has been moved to the Model class (frontend)
 
@@ -359,23 +1182,29 @@ class LocalBackend(Backend):
         header = f"reward: {trajectory.reward} {' '.join(f'{k}: {v}' for k, v in trajectory.metrics.items())}\n\n"
         formatted_messages = []
         for message_or_choice in trajectory.messages_and_choices:
-            if isinstance(message_or_choice, dict):
-                message = message_or_choice
+            if isinstance(message_or_choice, Choice):
+                message = cast(Message, message_or_choice.message.model_dump())
             else:
-                message = cast(Message, message_or_choice.message.model_dump())  # ty:ignore[possibly-missing-attribute]
+                message = message_or_choice
             formatted_messages.append(format_message(message))
         return header + "\n".join(formatted_messages)
 
     async def train(  # type: ignore[override]
         self,
-        model: TrainableModel,
+        model: AnyTrainableModel,
         trajectory_groups: Iterable[TrajectoryGroup],
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
-        beta: float = 0.0,
-        # RL algorithm settings
-        ppo: bool = False,
+        loss_fn: Literal["cispo", "ppo"] = "cispo",
+        loss_fn_config: dict | None = None,
+        normalize_advantages: bool = True,
+        adam_params: object | None = None,
+        # KL-penalized advantage adjustment
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_ref_adapter_path: str | None = None,
+        kl_penalty_source: Literal["current_learner", "sample"] = "current_learner",
         epsilon: float | None = None,
         epsilon_high: float | None = None,
         # Advantage computation
@@ -396,25 +1225,48 @@ class LocalBackend(Backend):
         truncated_importance_sampling: float | None = None,
         scale_learning_rate_by_reward_std_dev: bool = False,
         logprob_calculation_chunk_size: int = 1024,
+        packed_sequence_length: int | None = None,
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
+        optimizer_save_interval: int = 5,
         # Verbosity
         verbose: bool = False,
     ) -> LocalTrainResult:
         """Train the model on the given trajectory groups.
 
-        This is the recommended way to train models. Unlike model.train(), this
-        method does NOT automatically log trajectories or metrics. Call model.log()
-        explicitly before and/or after training if you want to log data.
+        This method does NOT automatically log trajectories or metrics. Call
+        model.log() explicitly before and/or after training if you want to log
+        data.
 
         Args:
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
-            beta: KL penalty coefficient. Defaults to 0.0.
-            ppo: Whether to use PPO clipping. Defaults to False.
-            epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
+            loss_fn: RL loss function. LocalBackend currently supports
+                "cispo" and "ppo".
+            loss_fn_config: Additional loss-function config. Not supported by
+                LocalBackend.
+            normalize_advantages: Backward-compatible alias for reward std scaling.
+                When False, LocalBackend centers rewards but does not divide by
+                group reward std dev.
+            adam_params: Custom optimizer params. Not supported by
+                LocalBackend.
+            kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
+                Tokens diverging more from the reference get reduced advantages.
+                Defaults to 0.0 (disabled).
+            kl_penalty_reference_step: Checkpoint step of the training model to
+                use as the KL reference. If None, uses the base model (LoRA
+                disabled) as reference.
+            kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
+                checkpoint to use as the KL reference. Alternative to
+                kl_penalty_reference_step.
+            kl_penalty_source: Which policy's logprobs to compare against the
+                reference when building the centered KL penalty. Use
+                "current_learner" to match the original ART implementation, or
+                "sample" to shape from the rollout policy logprobs, which is
+                usually better for async/off-policy workloads.
+            epsilon: Clip epsilon for importance sampling. Defaults based on loss_fn.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
             advantage_balance: Balance between negative and positive advantages
                 in range [-1.0, 1.0]. Defaults to 0.0 (balanced).
@@ -437,6 +1289,9 @@ class LocalBackend(Backend):
                 by reward standard deviation. Defaults to False.
             logprob_calculation_chunk_size: Chunk size for logprob calculation.
                 Defaults to 1024.
+            packed_sequence_length: Packed sequence length to use for training.
+                When unset, Unsloth keeps the current max-length-rounded-to-2048
+                behavior. Required for Megatron.
             num_trajectories_learning_rate_multiplier_power: Power for learning
                 rate multiplier based on number of trajectories.
             save_checkpoint: Whether to save a checkpoint after training.
@@ -447,62 +1302,85 @@ class LocalBackend(Backend):
             LocalTrainResult with step number, training metrics, and checkpoint path.
 
         Example:
-            # Before (deprecated):
-            await model.train(trajectory_groups, config=TrainConfig(learning_rate=5e-6))
-
-            # After (recommended):
             await model.log(trajectory_groups, split="train")
             result = await backend.train(model, trajectory_groups, learning_rate=5e-6)
             # Optionally log training metrics:
             # await model.log(metrics=result.metrics, step=result.step)
         """
         groups_list = list(trajectory_groups)
-
-        # Build config objects from explicit kwargs
-        config = TrainConfig(learning_rate=learning_rate, beta=beta)
-        dev_config: dev.TrainConfig = {
-            "advantage_balance": advantage_balance,
-            "allow_training_without_logprobs": allow_training_without_logprobs,
-            "importance_sampling_level": importance_sampling_level,
-            "mask_prob_ratio": mask_prob_ratio,
-            "plot_tensors": plot_tensors,
-            "ppo": ppo,
-            "precalculate_logprobs": precalculate_logprobs,
-            "scale_learning_rate_by_reward_std_dev": scale_learning_rate_by_reward_std_dev,
-            "scale_rewards": scale_rewards,
-            "logprob_calculation_chunk_size": logprob_calculation_chunk_size,
-            "num_trajectories_learning_rate_multiplier_power": num_trajectories_learning_rate_multiplier_power,
-        }
-        # Only include optional fields if they're set
-        if epsilon is not None:
-            dev_config["epsilon"] = epsilon
-        if epsilon_high is not None:
-            dev_config["epsilon_high"] = epsilon_high
-        if max_negative_advantage_importance_sampling_weight is not None:
-            dev_config["max_negative_advantage_importance_sampling_weight"] = (
-                max_negative_advantage_importance_sampling_weight
+        if loss_fn not in {"cispo", "ppo"}:
+            raise ValueError("LocalBackend only supports loss_fn='cispo' or 'ppo'.")
+        if loss_fn_config is not None:
+            raise ValueError("LocalBackend requires loss_fn_config=None.")
+        if not normalize_advantages:
+            scale_rewards = False
+        if adam_params is not None:
+            raise ValueError("LocalBackend requires adam_params=None.")
+        assert kl_penalty_source in {"current_learner", "sample"}
+        if (
+            self._requires_explicit_packed_sequence_length
+            and packed_sequence_length is None
+        ):
+            raise ValueError(
+                f"{type(self).__name__}.train requires packed_sequence_length to be set."
             )
-        if kimi_k2_tau is not None:
-            dev_config["kimi_k2_tau"] = kimi_k2_tau
-        if truncated_importance_sampling is not None:
-            dev_config["truncated_importance_sampling"] = truncated_importance_sampling
+
+        resolved_kl_ref_adapter_path = kl_ref_adapter_path
+        if (
+            resolved_kl_ref_adapter_path is None
+            and kl_penalty_reference_step is not None
+        ):
+            resolved_kl_ref_adapter_path = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path),
+                kl_penalty_reference_step,
+            )
+        elif (
+            resolved_kl_ref_adapter_path is None
+            and kl_penalty_coef > 0.0
+            and self._requires_explicit_packed_sequence_length
+        ):
+            resolved_kl_ref_adapter_path = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path),
+                0,
+            )
+        config, dev_config = build_rl_train_configs(
+            learning_rate=learning_rate,
+            advantage_balance=advantage_balance,
+            scale_rewards=scale_rewards,
+            importance_sampling_level=importance_sampling_level,
+            mask_prob_ratio=mask_prob_ratio,
+            ppo=loss_fn == "ppo",
+            precalculate_logprobs=precalculate_logprobs,
+            epsilon=epsilon,
+            epsilon_high=epsilon_high,
+            max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
+            kimi_k2_tau=kimi_k2_tau,
+            kl_penalty_coef=kl_penalty_coef,
+            kl_penalty_source=kl_penalty_source,
+            allow_training_without_logprobs=allow_training_without_logprobs,
+            plot_tensors=plot_tensors,
+            truncated_importance_sampling=truncated_importance_sampling,
+            scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
+            logprob_calculation_chunk_size=logprob_calculation_chunk_size,
+            packed_sequence_length=packed_sequence_length,
+            num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
+            kl_ref_adapter_path=resolved_kl_ref_adapter_path,
+            optimizer_save_interval=optimizer_save_interval,
+        )
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self._train_model(
             model, groups_list, config, dev_config, verbose
         ):
             training_metrics.append(metrics)
 
-        # Aggregate metrics
-        avg_metrics: dict[str, float] = {}
-        if training_metrics:
-            avg_metrics = {
-                k: sum(d.get(k, 0) for d in training_metrics)
-                / sum(1 for d in training_metrics if k in d)
-                for k in {k for d in training_metrics for k in d}
-                if k != "num_gradient_steps"
-            }
+        avg_metrics = aggregate_rl_training_metrics(
+            training_metrics=training_metrics,
+            trajectory_groups=groups_list,
+            trainer_started=trainer_started,
+        )
 
         # Get step and checkpoint path
         step = await self._get_step(model)
@@ -514,11 +1392,40 @@ class LocalBackend(Backend):
             if not os.path.exists(checkpoint_path):
                 checkpoint_path = None
 
+        # Record provenance on the latest W&B artifact
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            self._record_provenance_nonblocking(wandb_run, "local-rl")
+
         return LocalTrainResult(
             step=step,
             metrics=avg_metrics,
             checkpoint_path=checkpoint_path,
         )
+
+    def _record_provenance_nonblocking(self, wandb_run: Any, provenance: str) -> None:
+        key = (
+            str(wandb_run.entity),
+            str(wandb_run.project),
+            str(wandb_run.name),
+            provenance,
+        )
+
+        async def update() -> None:
+            try:
+                await asyncio.to_thread(
+                    record_provenance_for_artifact,
+                    entity=key[0],
+                    project=key[1],
+                    name=key[2],
+                    provenance=key[3],
+                )
+            except Exception:
+                logger.debug("Failed to record W&B provenance", exc_info=True)
+
+        task = asyncio.create_task(update())
+        self._provenance_update_tasks.add(task)
+        task.add_done_callback(self._provenance_update_tasks.discard)
 
     async def _train_model(
         self,
@@ -535,14 +1442,12 @@ class LocalBackend(Backend):
         if verbose:
             print("Packing tensors...")
 
-        # Count submitted groups and trainable groups
-        num_groups_submitted = len(trajectory_groups)
-        num_groups_trainable = sum(
-            1
-            for group in trajectory_groups
-            if group and len(set(trajectory.reward for trajectory in group)) > 1
+        summary = summarize_trajectory_groups(trajectory_groups)
+        base_metrics = build_training_summary_metrics(
+            summary,
+            include_trainable_groups=True,
         )
-
+        include_moe_routing = self._model_uses_expert_replay(model)
         packed_tensors = self._get_packed_tensors(
             model,
             trajectory_groups,
@@ -552,6 +1457,11 @@ class LocalBackend(Backend):
             ),
             scale_rewards=dev_config.get("scale_rewards", True),
             plot_tensors=dev_config.get("plot_tensors", False),
+            packed_sequence_length=dev_config.get("packed_sequence_length"),
+            logprob_calculation_chunk_size=dev_config.get(
+                "logprob_calculation_chunk_size", 1024
+            ),
+            include_moe_routing=include_moe_routing,
         )
         if packed_tensors is None:
             print(
@@ -563,6 +1473,10 @@ class LocalBackend(Backend):
             # Still advance the step by renaming the checkpoint directory
             current_step = self.__get_step(model)
             next_step = current_step + 1
+            logger.info(
+                f"[BACKEND] _train_model SKIP: current_step={current_step} "
+                f"next_step={next_step} (all rewards equal)"
+            )
             current_checkpoint_dir = get_step_checkpoint_dir(
                 get_model_dir(model=model, art_path=self._path), current_step
             )
@@ -570,51 +1484,120 @@ class LocalBackend(Backend):
                 get_model_dir(model=model, art_path=self._path), next_step
             )
 
-            # If the current checkpoint exists, rename it to the next step
+            # If the current checkpoint exists, copy it to the next step
             if os.path.exists(current_checkpoint_dir):
-                os.rename(current_checkpoint_dir, next_checkpoint_dir)
-                print(
-                    f"Advanced step from {current_step} to {next_step} (no training occurred)"
+                shutil.copytree(
+                    current_checkpoint_dir,
+                    next_checkpoint_dir,
+                    dirs_exist_ok=True,
+                )
+                logger.info(
+                    f"[BACKEND] _train_model SKIP: copied checkpoint "
+                    f"{current_step} -> {next_step}, calling register_lora_for_step..."
                 )
 
                 try:
-                    # Register the renamed checkpoint as a new LoRA adapter
+                    # Register the copied checkpoint as a new LoRA adapter
                     # so it's available for inference at the new step
-                    from ..unsloth.service import UnslothService
-
-                    if isinstance(service, UnslothService):
-                        await service.register_lora_for_step(
-                            next_step, next_checkpoint_dir
-                        )
+                    register_lora_for_step = getattr(
+                        service, "register_lora_for_step", None
+                    )
+                    if callable(register_lora_for_step):
+                        await register_lora_for_step(next_step, next_checkpoint_dir)
+                    logger.info(
+                        f"[BACKEND] _train_model SKIP: register_lora_for_step "
+                        f"completed for step {next_step}"
+                    )
                 except ModuleNotFoundError:
                     pass  # Unsloth is not installed
 
             # Yield metrics showing no groups were trainable
             # (the frontend will handle logging)
             yield {
-                "num_groups_submitted": num_groups_submitted,
-                "num_groups_trainable": 0,
-                "num_gradient_steps": 0,
+                **base_metrics,
+                "data/step_num_groups_trainable": 0.0,
+                "data/step_trainable_assistant_tokens": 0.0,
+                TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
             return
+        base_metrics["data/step_trainable_assistant_tokens"] = float(
+            packed_tensors["assistant_mask"].sum().item()
+        )
+        packed_sequences, packed_sequence_length = packed_tensors["tokens"].shape
+        non_padding_tokens = int((packed_tensors["group_ids"] != -1).sum().item())
+        packing_stats = packed_tensors["prefix_tree_packing_stats"]
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
+        service_dev_config = cast(dev.TrainConfig, {**dev_config})
+        grad_accumulation_sequences = await self._resolve_grad_accumulation_sequences(
+            service,
+            config,
+        )
+        fallback_gradient_steps = math.ceil(
+            packed_sequences / grad_accumulation_sequences
+        )
+        packed_train_tokens = int(
+            fallback_gradient_steps
+            * grad_accumulation_sequences
+            * packed_sequence_length
+        )
+        base_metrics.update(
+            {
+                "data/step_packed_sequences": float(packed_sequences),
+                "data/step_packed_train_tokens": float(packed_train_tokens),
+                "data/step_non_padding_train_tokens": float(non_padding_tokens),
+                "data/step_padding_ratio": (
+                    float(packed_train_tokens - non_padding_tokens)
+                    / packed_train_tokens
+                ),
+                "prefix_tree/logical_tokens": float(packing_stats["logical_tokens"]),
+                "prefix_tree/physical_tokens": float(packing_stats["physical_tokens"]),
+                "prefix_tree/compression_ratio": (
+                    packing_stats["logical_tokens"] / packing_stats["physical_tokens"]
+                ),
+            }
+        )
+        if include_moe_routing:
+            from ..megatron.routing_replay import (
+                build_moe_routing_replay_bundle_from_packed_tensors,
+            )
+
+            routing_replay_dir = (
+                f"{get_model_dir(model=model, art_path=self._path)}/tensors/"
+                "moe_routing_replay"
+            )
+            build_moe_routing_replay_bundle_from_packed_tensors(
+                packed_tensors=packed_tensors,
+                global_grad_accumulation_sequences=grad_accumulation_sequences,
+            ).to_dir(routing_replay_dir)
+            service_dev_config["moe_routing_replay_path"] = routing_replay_dir
+            service_dev_config["moe_routing_replay_strict"] = True
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        results: list[dict[str, float]] = []
-        estimated_gradient_steps = disk_packed_tensors["num_sequences"]
-        pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
+        pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
+        reported_gradient_steps: int | None = None
         async for result in service.train(
-            disk_packed_tensors, config, dev_config, verbose
+            disk_packed_tensors, config, service_dev_config, verbose
         ):
-            num_gradient_steps = int(
-                result.pop("num_gradient_steps", estimated_gradient_steps)
-            )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
-            results.append(result)
-            yield {**result, "num_gradient_steps": num_gradient_steps}
+            raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
+            if raw_num_gradient_steps is not None:
+                num_gradient_steps = int(raw_num_gradient_steps)
+                if reported_gradient_steps is None:
+                    reported_gradient_steps = num_gradient_steps
+                    if pbar.total != num_gradient_steps:
+                        pbar.total = num_gradient_steps
+                        pbar.refresh()
+                else:
+                    assert num_gradient_steps == reported_gradient_steps, (
+                        f"num_gradient_steps {num_gradient_steps} != reported_gradient_steps {reported_gradient_steps}"
+                    )
+            else:
+                num_gradient_steps = reported_gradient_steps or fallback_gradient_steps
+            yield {
+                **base_metrics,
+                **result,
+                TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+            }
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()
@@ -622,8 +1605,158 @@ class LocalBackend(Backend):
         if verbose:
             print("_train_model complete")
 
+    async def _resolve_grad_accumulation_sequences(
+        self,
+        service: ModelService,
+        config: TrainConfig,
+    ) -> int:
+        if config.grad_accumulation_sequences is not None:
+            return max(1, int(config.grad_accumulation_sequences))
+
+        service_key = id(service)
+        if service_key in self._grad_accumulation_sequences_by_service:
+            return self._grad_accumulation_sequences_by_service[service_key]
+
+        resolver = getattr(
+            cast(Any, service),
+            "resolve_global_grad_accumulation_sequences",
+            None,
+        )
+        if callable(resolver):
+            resolved = max(1, int(await resolver(config)))
+        else:
+            resolved = 1
+        self._grad_accumulation_sequences_by_service[service_key] = resolved
+        return resolved
+
     # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
     # have been moved to the Model class (frontend)
+
+    async def _train_sft(
+        self,
+        model: AnyTrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train the model using supervised fine-tuning.
+
+        Args:
+            model: The trainable model to fine-tune
+            trajectories: Iterable of Trajectory objects
+            config: SFT configuration with batch size, learning rates, and assistant
+                turn selection. A learning-rate list enables streaming mode.
+            dev_config: Developer configuration
+            verbose: Whether to print detailed logs
+
+        Yields:
+            Dictionary containing training metrics for each batch
+        """
+        if verbose:
+            print("Starting _train_sft")
+
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
+        if tokenizer_key not in self._tokenizers:
+            tokenizer = self._configure_training_tokenizer(
+                _load_training_tokenizer(model.base_model),
+                model=model,
+                internal_config=internal_config,
+            )
+            self._tokenizers[tokenizer_key] = tokenizer
+        tokenizer = self._tokenizers[tokenizer_key]
+
+        from ..utils.sft import resolve_sft_batch_size
+
+        batch_size = resolve_sft_batch_size(
+            batch_size=config.batch_size,
+            default_batch_size=self._default_sft_batch_size(),
+        )
+        service_config = config.model_copy(update={"batch_size": batch_size})
+
+        # Auto-detect instruction/response parts from model
+        from ..utils.model_config import get_instruction_response_parts
+
+        instruction_part, response_part = get_instruction_response_parts(
+            model.base_model, tokenizer
+        )
+        chat_template_kwargs = internal_config.get("chat_template_kwargs")
+        chat_template_tool_schema_format = self._chat_template_tool_schema_format(
+            internal_config
+        )
+
+        if verbose:
+            print(f"Using instruction_part: {instruction_part!r}")
+            print(f"Using response_part: {response_part!r}")
+
+        max_seq_length = self._model_max_sequence_length(model)
+
+        from ..preprocessing.tokenize import SFTBatch
+
+        # Build all batches in memory
+        trajectory_list = list(trajectories)
+        batches: list[SFTBatch] = []
+        total_dropped_trajectories = 0
+        for i in range(0, len(trajectory_list), batch_size):
+            batch_trajectories = trajectory_list[i : i + batch_size]
+            learning_rate = (
+                config.learning_rate[len(batches)]
+                if isinstance(config.learning_rate, list)
+                else config.learning_rate
+            )
+            batch = tokenize_sft_batch(
+                trajectory_batch=batch_trajectories,
+                learning_rate=learning_rate,
+                tokenizer=tokenizer,
+                instruction_part=instruction_part,
+                response_part=response_part,
+                chat_template_kwargs=chat_template_kwargs,
+                chat_template_tool_schema_format=chat_template_tool_schema_format,
+                max_seq_length=max_seq_length,
+                assistant_turns=config.assistant_turns,
+            )
+            total_dropped_trajectories += batch.num_dropped_trajectories
+            if batch.num_trainable_tokens > 0:
+                batches.append(batch)
+
+        if not batches:
+            if verbose:
+                print("No SFT batches contained trainable tokens")
+            return
+
+        # Get the service and train
+        service = await self._get_service(model)
+
+        pbar = tqdm.tqdm(total=len(batches), desc="sft train")
+        total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
+        total_trajectories = len(trajectory_list)
+        batch_count = 0
+
+        async for result in service.train_sft(batches, service_config, verbose):
+            pbar.update(1)
+            postfix: dict[str, str | int] = {
+                "loss": f"{result.get('loss/train', 0):.4f}"
+            }
+            if total_dropped_trajectories:
+                postfix["dropped"] = total_dropped_trajectories
+            pbar.set_postfix(postfix)
+            batch_count += 1
+            yield {
+                **result,
+                "data/step_num_trajectories": float(total_trajectories),
+                "data/step_trainable_assistant_tokens": float(total_trainable_tokens),
+                "data/step_num_dropped_trajectories": float(total_dropped_trajectories),
+                TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
+            }
+
+        pbar.close()
+
+        if verbose:
+            print("_train_sft complete")
+
+    def _default_sft_batch_size(self) -> int:
+        return 2
 
     # ------------------------------------------------------------------
     # Experimental support for S3
@@ -685,7 +1818,7 @@ class LocalBackend(Backend):
                 )
 
                 s3_latest_step = await get_latest_checkpoint_step_from_s3(
-                    model_name=model.name,
+                    model_name=model._storage_name(),
                     project=model.project,
                     s3_bucket=s3_bucket,
                     prefix=prefix,
@@ -694,10 +1827,12 @@ class LocalBackend(Backend):
             # Determine which source has the latest checkpoint
             if local_latest_step is None and s3_latest_step is None:
                 raise ValueError(
-                    f"No checkpoints found for {model.project}/{model.name} in local storage or S3"
+                    "No checkpoints found for "
+                    f"{model.project}/{model._storage_name()} in local storage or S3"
                 )
             elif local_latest_step is None:
-                resolved_step = s3_latest_step  # type: ignore[assignment]
+                assert s3_latest_step is not None
+                resolved_step = s3_latest_step
                 if verbose:
                     print(f"Using latest checkpoint from S3: step {resolved_step}")
             elif s3_latest_step is None:
@@ -734,7 +1869,7 @@ class LocalBackend(Backend):
             if verbose:
                 print(f"Pulling checkpoint step {resolved_step} from S3...")
             await pull_model_from_s3(
-                model_name=model.name,
+                model_name=model._storage_name(),
                 project=model.project,
                 step=resolved_step,
                 s3_bucket=s3_bucket,
@@ -818,7 +1953,7 @@ class LocalBackend(Backend):
                 )
 
                 latest_step = await get_latest_checkpoint_step_from_s3(
-                    model_name=model.name,
+                    model_name=model._storage_name(),
                     project=model.project,
                     s3_bucket=s3_bucket,
                     prefix=prefix,
@@ -839,7 +1974,7 @@ class LocalBackend(Backend):
                     print(f"Pulling specific checkpoint at step {step}")
 
         await pull_model_from_s3(
-            model_name=model.name,
+            model_name=model._storage_name(),
             project=model.project,
             step=step,
             s3_bucket=s3_bucket,
@@ -861,7 +1996,7 @@ class LocalBackend(Backend):
     ) -> None:
         """Upload the model directory from local storage to S3."""
         await push_model_to_s3(
-            model_name=model.name,
+            model_name=model._storage_name(),
             project=model.project,
             s3_bucket=s3_bucket,
             prefix=prefix,
@@ -904,7 +2039,7 @@ class LocalBackend(Backend):
         )
         dest_model_dir = get_output_dir_from_model_properties(
             project=model.project,
-            name=model.name,
+            name=model._storage_name(),
             art_path=self._path,
         )
 
@@ -1042,5 +2177,6 @@ class LocalBackend(Backend):
 
         if verbose:
             print(
-                f"Successfully forked checkpoint from {from_model} (step {selected_step}) to {model.name}"
+                "Successfully forked checkpoint from "
+                f"{from_model} (step {selected_step}) to {model._storage_name()}"
             )

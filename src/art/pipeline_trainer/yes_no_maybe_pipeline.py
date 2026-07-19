@@ -110,7 +110,12 @@ async def main() -> None:
     backend = TinkerNativeBackend()
 
     print(f"Initializing TrainableModel: {model_name}")
-    model = art.TrainableModel(name=model_name, project=PROJECT, base_model=BASE_MODEL)
+    model = art.TrainableModel(
+        name=model_name,
+        run_name=model_name,
+        project=PROJECT,
+        base_model=BASE_MODEL,
+    )
 
     print("Registering model with backend")
     await model.register(backend)
@@ -134,7 +139,7 @@ async def main() -> None:
         eval_fn=eval_callback,
         max_steps=MAX_STEPS,
         eval_every_n_steps=EVAL_EVERY_N_STEPS,
-        eval_step_0=False,
+        eval_at_start=False,
         total_scenarios=None,
     )
 

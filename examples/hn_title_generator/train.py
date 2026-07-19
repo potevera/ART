@@ -236,15 +236,14 @@ async def main():
     # Initialize ART Backend and Model
     backend = LocalBackend()
     model = art.TrainableModel(
+        run_name=MODEL_NAME,
         name=MODEL_NAME,
         project=PROJECT,
         base_model=BASE_MODEL,
+        lora_config=art.LoRAConfig(alpha=8),
         _internal_config=art.dev.InternalModelConfig(
             init_args=art.dev.InitArgs(
                 gpu_memory_utilization=0.75,
-            ),
-            peft_args=art.dev.PeftArgs(
-                lora_alpha=8,
             ),
             trainer_args=art.dev.TrainerArgs(
                 max_grad_norm=0.1,

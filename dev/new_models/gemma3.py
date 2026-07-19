@@ -19,7 +19,7 @@ async def rollout(model: art.TrainableModel, prompt: str) -> art.Trajectory:
     client = model.openai_client()
     chat_completion = await client.chat.completions.create(
         messages=messages,
-        model=model.name,
+        model=model.get_inference_name(),
         max_tokens=100,
         timeout=100,
     )
@@ -44,6 +44,7 @@ async def main():
 
     backend = LocalBackend()
     model = art.TrainableModel(
+        run_name="001-gemma3",
         name="001-gemma3",
         project="yes-no-maybe-s",
         base_model="google/gemma-3-4b-it",

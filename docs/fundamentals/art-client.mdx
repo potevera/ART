@@ -19,15 +19,6 @@ If you're curious about how ART allows you to run training and inference either 
   Run training and inference on autoscaling GPUs.
 </Card>
 <Card
-  title="SkyPilotBackend"
-  icon="cloud"
-  href="/fundamentals/art-backend#skypilotbackend"
-  horizontal={true}
-  arrow={true}
->
-  Run training and inference on a separate ephemeral machine.
-</Card>
-<Card
   title="LocalBackend"
   icon="laptop-code"
   href="/fundamentals/art-backend#localbackend"
@@ -62,11 +53,6 @@ Once you've initialized your [backend](/fundamentals/art-backend), you can regis
 ```python
 # managed training
 backend = ServerlessBackend()
-
-# remote training
-backend = SkyPilotBackend.initialize_cluster(
-    cluster_name="art", gpu="H100"
-)
 
 # local training
 backend = LocalBackend()
@@ -118,7 +104,7 @@ messages: art.Messages = [
 ]
 chat_completion = await openai_client.chat.completions.create(
     messages=messages,
-    model=model.name,
+    model=model.get_inference_name(),
     max_tokens=100,
     timeout=100,
     tools=[...]
@@ -171,7 +157,7 @@ async def rollout(model: art.Model, scenario: Scenario) -> art.Trajectory:
 
     # generate a completion using the client
     chat_completion = await openai_client.chat.completions.create(
-        messages=trajectory.messages(), model=model.name
+        messages=trajectory.messages(), model=model.get_inference_name()
     )
     choice = chat_completion.choices[0]
     trajectory.messages_and_choices.append(choice)
@@ -204,11 +190,9 @@ async def train(): # train for 50 steps
         # length of each train group: 8
 
         # send the grouped trajectories to the backend and wait until training finishes
-        await model.train(
-            train_groups,
-            config=art.TrainConfig(learning_rate=1e-5),
-        )
-        # once model.train finishes for the current step
+        result = await backend.train(model, train_groups, learning_rate=1e-5)
+        await model.log(train_groups, metrics=result.metrics, step=result.step, split="train")
+        # once backend.train finishes for the current step
         # the backend updates the LoRA weights for inference and
         # the training loop continues until 50 steps have completed
 ```

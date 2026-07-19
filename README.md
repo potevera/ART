@@ -42,7 +42,8 @@ from art.serverless.backend import ServerlessBackend
 model = art.TrainableModel(
   project="voice-agent",
   name="agent-001",
-  base_model="OpenPipe/Qwen3-14B-Instruct"
+  run_name="agent-001",
+  base_model="Qwen/Qwen3.6-27B"
 )
 
 backend = ServerlessBackend(
@@ -62,14 +63,17 @@ ART is an open-source RL framework that improves agent reliability by allowing L
 
 | Agent Task          | Example Notebook                                                                                                                       | Description                                         | Comparative Performance                                                                                                                                                                                                     |
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **ART•E [Serverless]**   | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/art-e.ipynb)                       | Qwen3 14B learns to search emails using RULER     | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/email_agent/accuracy-training-progress.svg" height="72"> [benchmarks](/dev/art-e/art_e/evaluate/display_benchmarks.ipynb)                              |
-| **2048 [Serverless]** | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb)                   | Qwen3 14B learns to play 2048                     | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/2048/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/2048/display_benchmarks.ipynb)                                                |
+| **ART•E [Serverless]**   | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/art-e.ipynb)                       | Qwen 3.6 27B learns to search emails using RULER  | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/email_agent/accuracy-training-progress.svg" height="72"> [benchmarks](/dev/art-e/art_e/evaluate/display_benchmarks.ipynb)                              |
+| **2048 [Serverless]** | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb)                   | Qwen 3.6 27B learns to play 2048                  | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/2048/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/2048/display_benchmarks.ipynb)                                                |
 | **ART•E LangGraph** | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/langgraph/art-e-langgraph.ipynb)   | Qwen 2.5 7B learns to search emails using LangGraph | [Link coming soon]                                                                                                                                                                                                          |
 | **MCP•RL**          | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/mcp-rl/mcp-rl.ipynb)               | Qwen 2.5 3B masters the NWS MCP server              | [Link coming soon]                                                                                                                                                                                                          |
 | **Temporal Clue**   | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/temporal_clue/temporal-clue.ipynb) | Qwen 2.5 7B learns to solve Temporal Clue           | [Link coming soon]                                                                                                                                                                                                          |
 | **Tic Tac Toe**     | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/tic_tac_toe/tic-tac-toe.ipynb)     | Qwen 2.5 3B learns to play Tic Tac Toe              | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/tic-tac-toe-local/accuracy-training-progress.svg" height="72"> [benchmarks](/examples/tic_tac_toe/display-benchmarks.ipynb)                            |
 | **Codenames**       | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/codenames/Codenames_RL.ipynb)      | Qwen 2.5 3B learns to play Codenames                | <img src="https://github.com/openpipe/art/raw/main/assets/benchmarks/codenames/win_rate_over_time.png" height="72"> [benchmarks](https://github.com/OpenPipe/art-notebooks/blob/main/examples/codenames/Codenames_RL.ipynb) |
 | **AutoRL [RULER]**  | [🏋️ Train agent](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/auto_rl.ipynb)                     | Train Qwen 2.5 7B to master any task                | [Link coming soon]                                                                                                                                                                                                          |
+| **Distillation (SFT)** | [🏋️ Train model](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/sft/distillation.ipynb)         | Distill text-to-SQL from Qwen 3 235B to Qwen 3.6 27B | [Link coming soon]                                                                                                                                                                                                          |
+| **Summarizer (SFT + RL)** | [🏋️ Train model](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/sft/sft-rl.ipynb)            | Train a document summarizer with SFT warmup then RL | [Link coming soon]                                                                                                                                                                                                          |
+| **SFT from a dataset** | [🏋️ Train model](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/sft/train_from_file.ipynb)      | Fine-tune Qwen 3.6 27B on text-to-SQL from a dataset | [Link coming soon]                                                                                                                                                                                                          |
 
 ## 📰 ART News
 
@@ -136,7 +140,7 @@ ART is in active development, and contributions are most welcome! Please see the
 
 ```bibtex
 @misc{hilton2025art,
-  author = {Brad Hilton and Kyle Corbitt and David Corbitt and Saumya Gandhi and Angky William and Bohdan Kovalenskyi and Andie Jones},
+  author = {Brad Hilton and Kyle Corbitt and David Corbitt and Saumya Gandhi and Angky William and Bohdan Kovalevskyi and Andie Jones},
   title = {ART: Agent Reinforcement Trainer},
   year = {2025},
   publisher = {GitHub},
@@ -157,7 +161,6 @@ ART stands on the shoulders of giants. While we owe many of the ideas and early 
 - [vLLM](https://github.com/vllm-project/vllm)
 - [trl](https://github.com/huggingface/trl)
 - [torchtune](https://github.com/pytorch/torchtune)
-- [SkyPilot](https://github.com/skypilot-org/skypilot)
 
 Finally, thank you to our partners who've helped us test ART in the wild! We're excited to see what you all build with it.
 

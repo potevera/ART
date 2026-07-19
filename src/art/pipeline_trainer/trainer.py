@@ -1,33 +1,110 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from collections.abc import Awaitable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import datetime, timezone
+import inspect
+import json
+import math
 import os
+from pathlib import Path
 import signal
+import sys
 import time
-from typing import Any, AsyncIterator, Generic, Iterable, TypeVar, cast
+from typing import (
+    Any,
+    AsyncIterator,
+    Generic,
+    Iterable,
+    Mapping,
+    Sequence,
+    TypeVar,
+    cast,
+)
+import warnings
+
+from typing_extensions import TypeIs
 
 T = TypeVar("T")
 
 import art
 from art import TrajectoryGroup
+from art.errors import LocalServingUnavailableError
+from art.pipeline_tuner import (
+    PackedGroupObservation,
+    PackedGroupShape,
+    PipelineAutotuneConfig,
+    PipelineAutotunerAttachment,
+    PipelineMetric,
+    PipelineRuntimeConfig,
+    PipelineTuneSettings,
+    RolloutWorkerController,
+)
 
+from .checkpoint_retention import (
+    CHECKPOINT_CREATED_AT_METRIC,
+    CHECKPOINT_EVAL_COMPLETED_METRIC,
+    CHECKPOINT_SAVED_METRIC,
+    CheckpointInfo,
+    CheckpointRetentionContext,
+    CheckpointRetentionStrategy,
+)
 from .state import PipelineState
 from .status import StatusReporter
 from .types import ConfigT, EvalFn, RolloutFn, ScenarioT, SingleRolloutFn  # noqa: F401
 
 PIPELINE_STATE_KEY = "_pipeline_trainer"
+_SCORE_FRESHNESS_TAU_STEPS = 8.0
+# Rollout critical batch size from the best current GRPO/RLVR evidence. This is
+# grounded in reported experiments, not a well-validated universal constant.
+_SCORE_CRITICAL_ROLLOUT_BATCH_SIZE = 300.0
+
+
+def _is_eval_mapping(
+    result: Sequence[art.Trajectory | art.TrajectoryGroup]
+    | Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]],
+) -> TypeIs[Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]]]:
+    return isinstance(result, Mapping)
 
 
 def _to_async_iterator(iterable: Iterable[T] | AsyncIterator[T]) -> AsyncIterator[T]:
     """Convert a sync Iterable to an AsyncIterator, or pass through if already async."""
     if isinstance(iterable, AsyncIterator):
-        return iterable
+        # ty cannot currently preserve T through this runtime generic check.
+        return cast(AsyncIterator[T], iterable)
 
     async def _iter():
         for item in iterable:
             yield item
 
     return _iter()
+
+
+def _weighted_percentile(points: list[tuple[float, float]], percentile: float) -> float:
+    if not points:
+        return 0.0
+    if not 0.0 <= percentile <= 1.0:
+        raise ValueError("percentile must be in [0, 1]")
+    ordered = sorted(points, key=lambda item: item[0])
+    total = sum(weight for _value, weight in ordered)
+    if total <= 0:
+        return ordered[-1][0]
+    target = percentile * total
+    running = 0.0
+    for value, weight in ordered:
+        running += weight
+        if running >= target:
+            return value
+    return ordered[-1][0]
+
+
+def _policy_age_exp(age: float) -> float:
+    exponent = max(age, 0.0) / _SCORE_FRESHNESS_TAU_STEPS
+    if exponent >= 700.0:
+        return math.inf
+    return math.exp(exponent)
 
 
 def make_group_rollout_fn(
@@ -47,6 +124,9 @@ def make_group_rollout_fn(
             *[single_rollout_fn(model, scenario, config) for _ in range(n)],
             return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, LocalServingUnavailableError):
+                raise result
         return TrajectoryGroup(results)
 
     return group_rollout
@@ -64,44 +144,73 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         config: ConfigT,
         eval_fn: EvalFn[ConfigT] | None = None,
         *,
-        # Pipeline settings
-        num_rollout_workers: int = 16,
-        min_batch_size: int = 4,
+        # Deprecated direct pipeline settings
+        # TODO(2026-09): Remove these backward-compatible aliases.
+        num_rollout_workers: int | None = None,
+        min_batch_size: int | None = None,
         max_batch_size: int | None = None,
-        max_steps_off_policy: int = 4,
         queue_maxsize: int | None = None,
+        pipeline: PipelineRuntimeConfig | None = None,
+        autotune: PipelineAutotuneConfig | None = None,
         # Training
         learning_rate: float = 1e-5,
         loss_fn: str = "cispo",
         loss_fn_config: dict | None = None,
         normalize_advantages: bool = True,
         adam_params: object | None = None,
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_step_lag: int | None = None,
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
+        max_steps_off_policy: int | None = 4,
+        limit_mean_steps_off_policy: float | None = None,
+        score_reference_groups_per_step: float | None = None,
+        score_reference_rollouts_per_group: float | None = None,
         # Status output
         log_interval_seconds: float = 60.0,
         status_ewa_alpha: float = 0.2,
         total_scenarios: int | None = None,
         # Eval/Checkpointing
         eval_every_n_steps: int = 20,
-        eval_step_0: bool = True,
+        eval_at_start: bool = True,
         save_checkpoint: bool = True,
+        optimizer_save_interval: int = 5,
+        checkpoint_retention_strategy: CheckpointRetentionStrategy | None = None,
+        checkpoint_retention_interval: int = 1,
         # Resumption
         resume: bool = True,
     ) -> None:
-        if num_rollout_workers <= 0:
-            raise ValueError("num_rollout_workers must be > 0")
-        if min_batch_size <= 0:
-            raise ValueError("min_batch_size must be > 0")
-        if max_batch_size is not None and max_batch_size <= 0:
-            raise ValueError("max_batch_size must be > 0")
-        if max_batch_size is not None and max_batch_size < min_batch_size:
-            raise ValueError("max_batch_size must be >= min_batch_size")
-        if max_steps_off_policy < 0:
-            raise ValueError("max_steps_off_policy must be >= 0")
-        if queue_maxsize is not None and queue_maxsize <= 0:
-            raise ValueError("queue_maxsize must be > 0")
+        autotune = autotune or PipelineAutotuneConfig()
+        pipeline_aliases = {
+            key: value
+            for key, value in {
+                "num_rollout_workers": num_rollout_workers,
+                "min_batch_size": min_batch_size,
+                "max_batch_size": max_batch_size,
+                "queue_maxsize": queue_maxsize,
+            }.items()
+            if value is not None
+        }
+        if autotune.mode != "off" and (pipeline is not None or pipeline_aliases):
+            raise ValueError(
+                "Pipeline runtime config cannot be provided when pipeline autotuning "
+                "is enabled. The autotuner owns the initial and online pipeline "
+                "settings."
+            )
+        if pipeline is not None and pipeline_aliases:
+            raise ValueError(
+                "Use either pipeline=PipelineRuntimeConfig(...) or deprecated direct "
+                "pipeline settings, not both."
+            )
+        if pipeline_aliases:
+            warnings.warn(
+                "Direct PipelineTrainer runtime settings are deprecated; pass "
+                "pipeline=PipelineRuntimeConfig(...) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        pipeline = pipeline or PipelineRuntimeConfig(**pipeline_aliases)
         if eval_every_n_steps < 0:
             raise ValueError("eval_every_n_steps must be >= 0")
         if max_steps is not None and max_steps < 0:
@@ -110,51 +219,99 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("log_interval_seconds must be > 0")
         if discard_queue_multiplier <= 0:
             raise ValueError("discard_queue_multiplier must be > 0")
+        if max_steps_off_policy is not None and max_steps_off_policy < 0:
+            raise ValueError("max_steps_off_policy must be >= 0")
+        if limit_mean_steps_off_policy is not None and limit_mean_steps_off_policy < 0:
+            raise ValueError("limit_mean_steps_off_policy must be >= 0")
+        if checkpoint_retention_interval <= 0:
+            raise ValueError("checkpoint_retention_interval must be > 0")
+        if optimizer_save_interval <= 0:
+            raise ValueError("optimizer_save_interval must be > 0")
+        if kl_penalty_step_lag is not None and kl_penalty_step_lag < 1:
+            raise ValueError("kl_penalty_step_lag must be >= 1")
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
         self.config = config
         self.eval_fn = eval_fn
-        self.num_rollout_workers = num_rollout_workers
-        self.min_batch_size = min_batch_size
+        self.pipeline = pipeline
+        self.autotune = autotune
+        self.num_rollout_workers = pipeline.num_rollout_workers
+        self.min_batch_size = pipeline.min_batch_size
         self.max_batch_size = (
-            max_batch_size if max_batch_size is not None else 10 * min_batch_size
+            pipeline.max_batch_size
+            if pipeline.max_batch_size is not None
+            else 10 * pipeline.min_batch_size
         )
+        self.target_groups_per_step = self.max_batch_size
         self.max_steps_off_policy = max_steps_off_policy
-        self.queue_maxsize = queue_maxsize
+        self.limit_mean_steps_off_policy = limit_mean_steps_off_policy
+        self.queue_maxsize = pipeline.queue_maxsize
         self.learning_rate = learning_rate
         self.loss_fn = loss_fn
         self.loss_fn_config = loss_fn_config
         self.normalize_advantages = normalize_advantages
         self.adam_params = adam_params
+        self.kl_penalty_coef = kl_penalty_coef
+        self.kl_penalty_step_lag = kl_penalty_step_lag
         self.max_steps = max_steps
         self._status_log_interval_seconds = log_interval_seconds
         self.eval_every_n_steps = eval_every_n_steps
-        self.eval_step_0 = eval_step_0
+        self.eval_at_start = eval_at_start
         self.save_checkpoint = save_checkpoint
+        self.optimizer_save_interval = optimizer_save_interval
+        self.checkpoint_retention_strategy = checkpoint_retention_strategy
+        self.checkpoint_retention_interval = checkpoint_retention_interval
+        self.score_reference_groups_per_step = (
+            score_reference_groups_per_step
+            if score_reference_groups_per_step is not None
+            else pipeline.score_reference_groups_per_step
+        )
+        self.score_reference_rollouts_per_group = (
+            score_reference_rollouts_per_group
+            if score_reference_rollouts_per_group is not None
+            else pipeline.score_reference_rollouts_per_group
+        )
         self.resume = resume
         self.discard_queue_multiplier = discard_queue_multiplier
         self._discard_queue: list[TrajectoryGroup] = []
-        self._discard_queue_limit = discard_queue_multiplier * min_batch_size
+        self._discard_queue_limit = discard_queue_multiplier * self.min_batch_size
         self._collapse_triggered = False
+        self._checkpoint_lease_counts: Counter[int] = Counter()
+        self._scheduled_eval_steps: set[int] = set()
+        self._scheduled_eval_leases: dict[int, AsyncExitStack] = {}
 
         self.state = PipelineState()
+        self._stop_event = asyncio.Event()
         self._scenario_lock = asyncio.Lock()
         self._scenario_iter: AsyncIterator[ScenarioT] | None = _to_async_iterator(
             scenarios
         )
+        self._scenario_source_exhausted = False
         self._output_queue: asyncio.Queue[TrajectoryGroup | None] | None = None
+        self._producer_rollout_timings = (0.0, 0.0, 0.0)
+        self._reported_producer_rollout_timings = (0.0, 0.0, 0.0)
         self._eval_queue: asyncio.Queue[int] | None = None
+        self._rollout_worker_controller = RolloutWorkerController(
+            self, self.num_rollout_workers
+        )
+        self._attachments: list[PipelineAutotunerAttachment] = []
+        if self.autotune.mode != "off":
+            self._attachments.append(PipelineAutotunerAttachment(self.autotune))
+        self._pipeline_tuner_profile: str | None = None
+        self._backend_training_completed = False
         self._status = StatusReporter(
             get_scenario_offset=lambda: self.state.scenario_offset,
             log_interval_seconds=log_interval_seconds,
             status_ewa_alpha=status_ewa_alpha,
             total_scenarios=total_scenarios,
-            num_workers=num_rollout_workers,
+            num_workers=self.num_rollout_workers,
         )
+        self._validate_backend_support()
 
     async def train(self, *, handle_signals: bool = True) -> None:
         """Run the training pipeline over the configured scenario iterator."""
+        self._backend_training_completed = False
         start_step = await self.model.get_step()
         pipeline_state = self._read_pipeline_state() if self.resume else {}
         scenario_offset = int(pipeline_state.get("scenario_offset", 0) or 0)
@@ -173,27 +330,45 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.state.total_scenarios_consumed = int(
             pipeline_state.get("total_scenarios_consumed", scenario_offset) or 0
         )
+        self.state.accepted_trainable_groups = int(
+            pipeline_state.get("accepted_trainable_groups", 0) or 0
+        )
+        self.state.discarded_stale_groups = int(
+            pipeline_state.get("discarded_stale_groups", 0) or 0
+        )
+        self.state.discarded_zero_variance_groups = int(
+            pipeline_state.get("discarded_zero_variance_groups", 0) or 0
+        )
         self.state.last_eval_step = last_eval_step
+        self.state.completed_eval_steps = {
+            int(step) for step in pipeline_state.get("completed_eval_steps", []) or []
+        }
 
         if scenario_offset > 0 and self._scenario_iter is not None:
             skipped = await self._skip_scenarios(self._scenario_iter, scenario_offset)
             self.state.scenario_offset = skipped
             self.state.total_scenarios_consumed = skipped
 
+        try:
+            await self._start_attachments()
+        except BaseException as primary:
+            try:
+                await self._stop_attachments(training_failed=True)
+            except BaseException as cleanup:
+                raise BaseExceptionGroup(
+                    "Pipeline attachment startup and cleanup failed.",
+                    [primary, cleanup],
+                ) from None
+            raise
+
         queue_maxsize = (
             self.queue_maxsize
             if self.queue_maxsize is not None
-            else max(1, self.max_steps_off_policy * self.max_batch_size)
+            else max(1, self._freshness_queue_window() * self.target_groups_per_step)
         )
         self._output_queue = asyncio.Queue(maxsize=queue_maxsize)
         self._eval_queue = asyncio.Queue()
 
-        if self.eval_fn is not None and self.eval_step_0 and start_step == 0:
-            await self._eval_queue.put(start_step)
-            self.state.last_eval_step = start_step
-            self._persist_state(start_step)
-
-        self._status.start(initial_step=start_step)
         loop = asyncio.get_running_loop()
         stop_requested = False
         installed_handlers: list[tuple[str, signal.Signals]] = []
@@ -210,30 +385,42 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         def _sync_signal_handler(signum: int, _frame: object | None) -> None:
             _request_stop(signal.Signals(signum))
 
-        if handle_signals:
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                original_handlers[sig] = signal.getsignal(sig)
-                try:
-                    loop.add_signal_handler(sig, _request_stop, sig)
-                    installed_handlers.append(("loop", sig))
-                except (NotImplementedError, RuntimeError):
-                    try:
-                        signal.signal(sig, _sync_signal_handler)
-                        installed_handlers.append(("signal", sig))
-                    except (ValueError, RuntimeError):
-                        continue
+        training_failed = False
         try:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._rollout_stage(), name="rollout_stage")
-                tg.create_task(self._training_stage(), name="training_stage")
-                tg.create_task(self._eval_stage(), name="eval_stage")
-                tg.create_task(self._status_loop(), name="status_loop")
-        except* Exception as eg:
-            for exc in eg.exceptions:
-                if not isinstance(exc, asyncio.CancelledError):
-                    print(f"Pipeline stage failed: {exc}")
-            raise
+            if self.eval_fn is not None and self.eval_at_start:
+                await self._schedule_eval_step(start_step)
+                self._persist_state(start_step)
+
+            self._status.start(initial_step=start_step)
+            if handle_signals:
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    original_handlers[sig] = signal.getsignal(sig)
+                    try:
+                        loop.add_signal_handler(sig, _request_stop, sig)
+                        installed_handlers.append(("loop", sig))
+                    except (NotImplementedError, RuntimeError):
+                        try:
+                            signal.signal(sig, _sync_signal_handler)
+                            installed_handlers.append(("signal", sig))
+                        except (ValueError, RuntimeError):
+                            continue
+
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self._rollout_stage(), name="rollout_stage")
+                    tg.create_task(self._training_stage(), name="training_stage")
+                    tg.create_task(self._eval_stage(), name="eval_stage")
+                    tg.create_task(self._status_loop(), name="status_loop")
+            except* Exception as eg:
+                training_failed = True
+                self.request_stop()
+                for exc in eg.exceptions:
+                    if not isinstance(exc, asyncio.CancelledError):
+                        print(f"Pipeline stage failed: {exc}")
+                raise
         finally:
+            primary_failure = sys.exception()
+            training_failed = training_failed or primary_failure is not None
             if handle_signals:
                 for mode, sig in installed_handlers:
                     if mode == "loop":
@@ -247,33 +434,220 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                             signal.signal(sig, cast(signal.Handlers, previous))
                     except (ValueError, RuntimeError):
                         pass
-            self._status.flush()
-            self._status.close()
+            cleanup_failures: list[BaseException] = []
+            if not training_failed:
+                try:
+                    await self._finalize_backend_training()
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            try:
+                await self._stop_attachments(training_failed=training_failed)
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+            for cleanup in (self._status.flush, self._status.close):
+                try:
+                    cleanup()
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            try:
+                await self._release_all_scheduled_eval_leases()
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+            if cleanup_failures:
+                if primary_failure is not None:
+                    raise BaseExceptionGroup(
+                        "Pipeline training and cleanup failed.",
+                        [primary_failure, *cleanup_failures],
+                    ) from None
+                if len(cleanup_failures) == 1:
+                    raise cleanup_failures[0]
+                raise BaseExceptionGroup(
+                    "Pipeline cleanup failed.", cleanup_failures
+                ) from None
 
     def request_stop(self) -> None:
         """Request a clean shutdown of the pipeline stages."""
-        if self.state.done:
-            return
         self.state.done = True
+        self._stop_event.set()
 
-        async def _notify_policy() -> None:
-            async with self.state.policy_updated:
-                self.state.policy_updated.notify_all()
-
+    async def _await_or_stop(self, awaitable: Awaitable[T]) -> tuple[bool, T | None]:
+        operation = asyncio.ensure_future(awaitable)
+        stop_wait = asyncio.create_task(self._stop_event.wait())
+        tasks = (operation, stop_wait)
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if operation in done:
+                return True, operation.result()
+            return False, None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        if loop is None:
+    async def _finalize_backend_training(self) -> None:
+        if not self._backend_training_completed:
+            return
+        finalize = getattr(self.backend, "finalize_training_session", None)
+        if finalize is not None:
+            await finalize(self.model)
+
+    def apply_pipeline_settings(self, settings: PipelineTuneSettings) -> None:
+        self.num_rollout_workers = settings.num_rollout_workers
+        self.min_batch_size = settings.min_batch_size
+        self.max_batch_size = settings.max_batch_size
+        self.target_groups_per_step = settings.target_groups_per_step
+        self.queue_maxsize = settings.queue_maxsize
+        self._discard_queue_limit = self.discard_queue_multiplier * self.min_batch_size
+        self._rollout_worker_controller.set_target(self.num_rollout_workers)
+        if self._output_queue is not None:
+            cast(Any, self._output_queue)._maxsize = self.queue_maxsize
+        self._status._num_workers = self.num_rollout_workers
+
+    async def _start_attachments(self) -> None:
+        for attachment in self._attachments:
+            await attachment.on_start(self)
+
+    async def _stop_attachments(self, *, training_failed: bool = False) -> None:
+        failures: list[BaseException] = []
+        for attachment in reversed(self._attachments):
+            try:
+                await attachment.on_stop(training_failed=training_failed)
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise BaseExceptionGroup("Pipeline attachment cleanup failed.", failures)
+
+    async def _emit_pipeline_metric(
+        self,
+        name: str,
+        value: float,
+        *,
+        step: int | None,
+        tags: dict[str, str] | None = None,
+    ) -> None:
+        if not self._attachments:
+            return
+        metric = PipelineMetric(
+            name=name,
+            value=float(value),
+            step=step,
+            t_s=time.monotonic(),
+            tags=tags or {},
+        )
+        for attachment in self._attachments:
+            await attachment.on_metric(metric)
+
+    async def _emit_pipeline_metrics(
+        self, metrics: Mapping[str, float], *, step: int | None
+    ) -> None:
+        for name, value in metrics.items():
+            if isinstance(value, (int, float)):
+                await self._emit_pipeline_metric(name, float(value), step=step)
+
+    def _collect_attachment_train_step_metrics(self) -> tuple[dict[str, float], bool]:
+        metrics: dict[str, float] = {}
+        owns_vllm_metrics = False
+        for attachment in self._attachments:
+            collector = getattr(attachment, "collect_train_step_metrics", None)
+            if not callable(collector):
+                continue
+            attachment_metrics = collector()
+            if not isinstance(attachment_metrics, Mapping):
+                raise RuntimeError(
+                    "Pipeline attachment train-step metrics collector returned a "
+                    "non-mapping result."
+                )
+            metrics.update(
+                {
+                    name: float(value)
+                    for name, value in attachment_metrics.items()
+                    if isinstance(value, (int, float))
+                }
+            )
+            owns_vllm_metrics = owns_vllm_metrics or bool(
+                getattr(attachment, "owns_train_step_vllm_metrics", lambda: False)()
+            )
+        return metrics, owns_vllm_metrics
+
+    async def _emit_packed_group_observations(
+        self, metrics: Mapping[str, float], *, batch: list[TrajectoryGroup], step: int
+    ) -> None:
+        if not self._attachments:
+            return
+        observations: list[PackedGroupObservation] = []
+        for group in batch:
+            shape = group._packed_group_shape
+            group._collect_packing_shape = False
+            group._packed_group_shape = None
+            if shape is None:
+                continue
+            if not isinstance(shape, PackedGroupShape):
+                raise RuntimeError("Backend returned an invalid packed-group shape")
+            observations.append(
+                PackedGroupObservation(
+                    step=step,
+                    leaves=shape.leaves,
+                )
+            )
+        groups = int(metrics.get("data/step_num_groups_trainable", 0.0) or 0)
+        if groups > 0 and len(observations) != groups:
+            raise RuntimeError(
+                "Pipeline autotuning requires packed-group token observations "
+                "from the backend packer."
+            )
+        if not observations:
+            return
+        for observation in observations:
+            for attachment in self._attachments:
+                await attachment.on_packed_group(observation)
+
+    def _validate_backend_support(self) -> None:
+        from art.dev.validate import is_dedicated_mode
+        from art.local.backend import LocalBackend
+
+        if self.eval_fn is not None and not callable(
+            getattr(self.backend, "exact_adapter_lease", None)
+        ):
+            raise ValueError(
+                "PipelineTrainer eval requires a backend with exact checkpoint "
+                "inference leases."
+            )
+        if not isinstance(self.backend, LocalBackend):
             return
 
-        loop.create_task(_notify_policy())
-        if self._output_queue is not None:
-            try:
-                self._output_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                loop.create_task(self._output_queue.put(None))
+        model_config = self.model._internal_config or art.dev.InternalModelConfig()
+        if not is_dedicated_mode(model_config):
+            raise ValueError(
+                "PipelineTrainer only supports LocalBackend in dedicated mode. "
+                "Shared LocalBackend pauses inference during training and is not "
+                "a supported async PipelineTrainer path. Set both "
+                "trainer_gpu_ids and inference_gpu_ids on the TrainableModel "
+                "_internal_config to use LocalBackend with PipelineTrainer."
+            )
+        if (
+            self.eval_fn is not None
+            and model_config.get("tinker_args") is None
+            and model_config.get("rollout_weights_mode", "lora") != "lora"
+        ):
+            raise ValueError(
+                "PipelineTrainer eval requires rollout_weights_mode='lora' so "
+                "the requested checkpoint can remain immutable during eval."
+            )
+        if self.loss_fn not in {"cispo", "ppo"}:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) only supports "
+                "loss_fn='cispo' or loss_fn='ppo'."
+            )
+        if self.loss_fn_config is not None:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires "
+                "loss_fn_config=None."
+            )
+        if self.adam_params is not None:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires adam_params=None."
+            )
 
     async def _skip_scenarios(
         self, scenarios: AsyncIterator[ScenarioT], count: int
@@ -293,42 +667,160 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         return skipped
 
     async def _get_next_scenario(self) -> ScenarioT | None:
-        if self._scenario_iter is None:
+        if self._scenario_iter is None or self._scenario_source_exhausted:
             return None
         async with self._scenario_lock:
+            if self._scenario_source_exhausted:
+                return None
             try:
-                scenario = await anext(self._scenario_iter)
+                completed, scenario = await self._await_or_stop(
+                    anext(self._scenario_iter)
+                )
             except StopAsyncIteration:
+                self._scenario_source_exhausted = True
+                return None
+            if not completed:
                 return None
             self.state.scenario_offset += 1
             self.state.total_scenarios_consumed += 1
-            return scenario
+            return cast(ScenarioT, scenario)
 
     async def _wait_for_policy(self) -> None:
+        if self.max_steps_off_policy is None:
+            return
         async with self.state.policy_updated:
             while (
                 not self.state.done
                 and self.state.policy_version
                 < self.state.next_training_step - self.max_steps_off_policy
             ):
-                await self.state.policy_updated.wait()
+                completed, _ = await self._await_or_stop(
+                    self.state.policy_updated.wait()
+                )
+                if not completed:
+                    return
+
+    @asynccontextmanager
+    async def _checkpoint_lease(self, step: int) -> AsyncIterator[None]:
+        self._checkpoint_lease_counts[step] += 1
+        try:
+            yield
+        finally:
+            self._release_checkpoint_lease(step)
+
+    @asynccontextmanager
+    async def _adapter_retention_lease(self, step: int) -> AsyncIterator[None]:
+        async with self._checkpoint_lease(step):
+            if not hasattr(type(self.backend), "adapter_retention_lease"):
+                yield
+                return
+            lease = getattr(self.backend, "adapter_retention_lease", None)
+            if lease is None:
+                yield
+                return
+            async with lease(self.model, step):
+                yield
+
+    @asynccontextmanager
+    async def _adapter_lease(self, step: int) -> AsyncIterator[None]:
+        if not hasattr(type(self.backend), "adapter_lease"):
+            async with self._checkpoint_lease(step):
+                yield
+            return
+        async with self._checkpoint_lease(step):
+            lease = getattr(self.backend, "adapter_lease", None)
+            if lease is None:
+                yield
+                return
+            async with lease(self.model, step):
+                yield
+
+    @asynccontextmanager
+    async def _exact_adapter_lease(self, step: int) -> AsyncIterator[None]:
+        lease = getattr(self.backend, "exact_adapter_lease")
+        async with self._checkpoint_lease(step), lease(self.model, step):
+            yield
+
+    def _release_checkpoint_lease(self, step: int) -> None:
+        self._checkpoint_lease_counts[step] -= 1
+        if self._checkpoint_lease_counts[step] <= 0:
+            del self._checkpoint_lease_counts[step]
+
+    async def _schedule_eval_step(self, step: int) -> None:
+        if self._eval_queue is None:
+            raise RuntimeError("eval queue is not initialized")
+        if step in self._scheduled_eval_steps:
+            return
+        stack = AsyncExitStack()
+        await stack.enter_async_context(self._adapter_retention_lease(step))
+        try:
+            self._scheduled_eval_leases[step] = stack
+            self._scheduled_eval_steps.add(step)
+            await self._eval_queue.put(step)
+            self.state.last_eval_step = step
+        except Exception:
+            self._scheduled_eval_steps.discard(step)
+            self._scheduled_eval_leases.pop(step, None)
+            await stack.aclose()
+            raise
+
+    async def _release_scheduled_eval_lease(self, step: int) -> None:
+        self._scheduled_eval_steps.discard(step)
+        stack = self._scheduled_eval_leases.pop(step, None)
+        if stack is not None:
+            await stack.aclose()
+
+    async def _release_all_scheduled_eval_leases(self) -> None:
+        for step in tuple(self._scheduled_eval_leases):
+            await self._release_scheduled_eval_lease(step)
+
+    def _retained_adapter_steps(self, current_step: int) -> set[int]:
+        min_step = max(0, current_step - self._retention_window_steps())
+        return set(range(min_step, current_step + 1))
+
+    def _kl_penalty_reference_step(self, current_step: int) -> int:
+        if self.kl_penalty_step_lag is None:
+            return 0
+        return max(0, current_step - self.kl_penalty_step_lag)
+
+    async def _prune_model_adapters(self, current_step: int) -> None:
+        if not hasattr(type(self.backend), "prune_model_adapters"):
+            return
+        prune = getattr(self.backend, "prune_model_adapters", None)
+        if prune is None:
+            return
+        await prune(
+            self.model,
+            retain_steps=self._retained_adapter_steps(current_step),
+        )
 
     async def _rollout_worker(self, worker_id: int) -> None:
         assert self._output_queue is not None
         while not self.state.done:
+            if not self._rollout_worker_controller.worker_allowed(worker_id):
+                break
             scenario = await self._get_next_scenario()
             if scenario is None:
                 break
             self._status.note_rollout_started()
             errored = False
             try:
+                wait_started = time.monotonic()
                 await self._wait_for_policy()
+                actor_idle_s = time.monotonic() - wait_started
                 if self.state.done:
                     break
 
                 initial_version = self.state.policy_version
 
-                group = await self.rollout_fn(self.model, scenario, self.config)
+                token = self.model.activate_metrics_context("train")
+                rollout_started = time.monotonic()
+                try:
+                    async with self._adapter_lease(initial_version):
+                        group = await self.rollout_fn(self.model, scenario, self.config)
+                finally:
+                    token.var.reset(token)
+                rollout_wall_s = time.monotonic() - rollout_started
                 if not isinstance(group, TrajectoryGroup):
                     errored = True
                     continue
@@ -340,24 +832,33 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 )
                 if self.state.done:
                     break
-                await self._put_output_group(group)
+                queue_wait_s = await self._put_output_group(group)
+                self._record_producer_rollout_timings(
+                    rollout_wall_s, actor_idle_s + queue_wait_s, queue_wait_s
+                )
             except asyncio.CancelledError:
+                raise
+            except LocalServingUnavailableError:
                 raise
             except Exception as exc:
                 errored = True
-                print(f"Worker {worker_id}: rollout failed: {exc}")
+                exc_type = f"{type(exc).__module__}.{type(exc).__name__}"
+                print(
+                    f"Worker {worker_id}: rollout failed ({exc_type}): {exc!r}"
+                    f"{self._scenario_error_context(scenario)}"
+                )
             finally:
                 self._status.note_rollout_finished(errored=errored)
 
     async def _rollout_stage(self) -> None:
-        async with asyncio.TaskGroup() as tg:
-            for i in range(self.num_rollout_workers):
-                tg.create_task(self._rollout_worker(i))
-        if not self.state.done and self._output_queue is not None:
-            try:
-                self._output_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                await self._output_queue.put(None)
+        await self._rollout_worker_controller.run()
+        if (
+            self._scenario_source_exhausted
+            and not self.state.done
+            and self._output_queue is not None
+        ):
+            print("Scenario source exhausted; draining completed rollouts.")
+            await self._await_or_stop(self._output_queue.put(None))
 
     async def _training_stage(self) -> None:
         if self._output_queue is None:
@@ -368,10 +869,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             current_step + self.max_steps if self.max_steps is not None else None
         )
         if stop_at_step is not None and current_step >= stop_at_step:
-            self.state.done = True
             self._persist_state(current_step)
-            async with self.state.policy_updated:
-                self.state.policy_updated.notify_all()
+            self.request_stop()
             return
         stop_after_batch = False
 
@@ -379,13 +878,21 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if stop_at_step is not None and current_step >= stop_at_step:
                 break
             step_start = time.monotonic()
+            collect_started = time.monotonic()
+            zero_variance_before = self.state.discarded_zero_variance_groups
             batch, discarded, saw_sentinel = await self._collect_batch(current_step)
-            self.state.discarded_stale_samples += discarded
+            trainer_idle_s = time.monotonic() - collect_started
+            zero_variance_discarded = (
+                self.state.discarded_zero_variance_groups - zero_variance_before
+            )
+            dequeued_groups = len(batch) + discarded + zero_variance_discarded
+            self.state.discarded_stale_groups += discarded
             if discarded:
                 self._status.note_stale(discarded)
             if not batch:
                 break
 
+            training_policy_step = current_step
             expected_step = current_step + 1
             should_eval_step = self._should_eval_step(expected_step)
             should_checkpoint = self.save_checkpoint and should_eval_step
@@ -395,27 +902,46 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self.state.policy_updated.notify_all()
 
             self._status.note_training_start(len(batch))
-            train_call_start: float | None = None
+            train_call_start = time.monotonic()
             if os.getenv("ART_TRAIN_STEP_LOG"):
                 print(f"[train] step {expected_step} starting (batch={len(batch)})")
-                train_call_start = time.perf_counter()
             try:
+                train_kwargs: dict[str, Any] = {
+                    "learning_rate": self.learning_rate,
+                    "loss_fn": self.loss_fn,
+                    "loss_fn_config": self.loss_fn_config,
+                    "normalize_advantages": self.normalize_advantages,
+                    "save_checkpoint": should_checkpoint,
+                    "adam_params": self.adam_params,
+                    "optimizer_save_interval": self.optimizer_save_interval,
+                }
+                if self.kl_penalty_coef > 0.0:
+                    kl_penalty_reference_step = self._kl_penalty_reference_step(
+                        current_step
+                    )
+                    train_kwargs["kl_penalty_coef"] = self.kl_penalty_coef
+                    train_kwargs["kl_penalty_source"] = "sample"
+                    train_kwargs["kl_penalty_reference_step"] = (
+                        kl_penalty_reference_step
+                    )
+                if self.autotune.mode != "off":
+                    for group in batch:
+                        group._collect_packing_shape = True
                 result = await self.backend.train(
                     self.model,
                     batch,
-                    learning_rate=self.learning_rate,
-                    loss_fn=self.loss_fn,
-                    loss_fn_config=self.loss_fn_config,
-                    normalize_advantages=self.normalize_advantages,
-                    save_checkpoint=should_checkpoint,
-                    adam_params=self.adam_params,
+                    **train_kwargs,
                 )
+                self._backend_training_completed = True
             except Exception:
+                for group in batch:
+                    group._collect_packing_shape = False
+                    group._packed_group_shape = None
                 self._status.note_training_end()
                 raise
             finally:
-                if train_call_start is not None:
-                    train_call_elapsed = time.perf_counter() - train_call_start
+                train_call_elapsed = time.monotonic() - train_call_start
+                if os.getenv("ART_TRAIN_STEP_LOG"):
                     print(
                         f"[train] step {expected_step} done in "
                         f"{train_call_elapsed:.1f}s"
@@ -425,34 +951,90 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 current_step = result.step
                 self.state.policy_version = current_step
                 self.state.next_training_step = current_step
+                await self._log_checkpoint_saved(result)
+                await self._prune_model_adapters(current_step)
+                await self._run_checkpoint_retention(current_step)
 
                 step_seconds = time.monotonic() - step_start
+                actor_wall_s, actor_idle_s, queue_wait_s = (
+                    self._consume_producer_rollout_timings()
+                )
                 self._status.note_training_batch(
                     batch, step=current_step, step_seconds=step_seconds
                 )
 
-                steps_off_policy = self._average_steps_off_policy(current_step, batch)
+                stale_groups = float(self.state.discarded_stale_groups)
+                zero_variance_groups = float(self.state.discarded_zero_variance_groups)
+                self.state.accepted_trainable_groups += len(batch)
+                generated_groups_cum = (
+                    float(self.state.accepted_trainable_groups)
+                    + stale_groups
+                    + zero_variance_groups
+                )
                 metrics = {
-                    "discarded_stale_samples": float(
-                        self.state.discarded_stale_samples
+                    "discarded/cum/stale_groups": stale_groups,
+                    "discarded/cum/zero_variance_groups": zero_variance_groups,
+                    "discarded/step/stale_groups": float(discarded),
+                    "discarded/step/zero_variance_groups": float(
+                        zero_variance_discarded
                     ),
-                    "steps_off_policy": steps_off_policy,
-                    "num_groups": float(len(batch)),
+                    "discarded/rate/stale_groups": stale_groups
+                    / max(generated_groups_cum, 1.0),
+                    "discarded/rate/zero_variance_groups": zero_variance_groups
+                    / max(generated_groups_cum, 1.0),
+                    "time/step_wall_s": step_seconds,
+                    "time/step_collect_batch_s": trainer_idle_s,
+                    "time/step_trainer_idle_s": trainer_idle_s,
+                    "time/step_rollout_s": actor_wall_s,
+                    "time/step_rollout_idle_s": actor_idle_s,
+                    "queue/put_wait_s": queue_wait_s,
+                    "queue/put_wait_frac": queue_wait_s
+                    / max(queue_wait_s + actor_wall_s, 1e-9),
+                    "queue/actual_stale_fraction": discarded / max(dequeued_groups, 1),
                 }
+                metrics.setdefault("time/step_backend_train_s", train_call_elapsed)
                 metrics.update(result.metrics)
+                attachment_metrics, attachment_owns_vllm_metrics = (
+                    self._collect_attachment_train_step_metrics()
+                )
+                metrics.update(attachment_metrics)
+                vllm_metrics_collector = getattr(
+                    self.backend, "collect_train_step_vllm_metrics", None
+                )
+                if (
+                    callable(vllm_metrics_collector)
+                    and not attachment_owns_vllm_metrics
+                    and self.model._serving_capabilities is not None
+                    and self.model._serving_capabilities.fast_metrics
+                ):
+                    maybe_metrics = vllm_metrics_collector(self.model)
+                    if inspect.isawaitable(maybe_metrics):
+                        metrics.update(await maybe_metrics)
+                metrics.update(
+                    self._score_metrics(
+                        training_policy_step,
+                        batch,
+                        step_seconds=step_seconds,
+                        result_metrics=metrics,
+                    )
+                )
+                metrics.update(self._queue_freshness_metrics(current_step))
+                metrics.update(self._pipeline_settings_metrics())
 
+                await self._emit_packed_group_observations(
+                    metrics, batch=batch, step=current_step
+                )
+                await self._emit_pipeline_metrics(metrics, step=current_step)
                 await self.model.log(
                     batch,
                     split="train",
                     step=current_step,
                     metrics=metrics,
                 )
-                await self._log_discarded_groups(current_step)
+                await self._log_zero_variance_groups(current_step)
 
                 if self.eval_fn is not None and should_eval_step:
-                    if self._eval_queue is not None:
-                        await self._eval_queue.put(current_step)
-                    self.state.last_eval_step = current_step
+                    await self._schedule_eval_step(current_step)
 
                 self._persist_state(current_step)
             finally:
@@ -466,10 +1048,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if stop_after_batch:
                 break
 
-        self.state.done = True
         self._persist_state(current_step)
-        async with self.state.policy_updated:
-            self.state.policy_updated.notify_all()
+        self.request_stop()
 
     async def _collect_batch(
         self, current_step: int
@@ -478,16 +1058,18 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         batch: list[TrajectoryGroup] = []
         discarded = 0
         saw_sentinel = False
-        min_version = current_step - self.max_steps_off_policy
 
         while len(batch) < self.min_batch_size:
-            item = await self._output_queue.get()
+            completed, item = await self._await_or_stop(self._output_queue.get())
+            if not completed:
+                saw_sentinel = True
+                break
             if item is None:
                 saw_sentinel = True
                 break
             self._status.note_group_dequeued(item)
             self._check_all_failed(item)
-            if self._is_group_stale(item, min_version):
+            if self._is_group_stale(item, current_step):
                 discarded += 1
                 continue
             if self._group_zero_variance(item):
@@ -496,7 +1078,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 continue
             batch.append(item)
 
-        while not saw_sentinel:
+        while not saw_sentinel and len(batch) < self.max_batch_size:
             try:
                 item = self._output_queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -506,7 +1088,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 break
             self._status.note_group_dequeued(item)
             self._check_all_failed(item)
-            if self._is_group_stale(item, min_version):
+            if self._is_group_stale(item, current_step):
                 discarded += 1
                 continue
             if self._group_zero_variance(item):
@@ -531,11 +1113,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return
 
         pending_eval: asyncio.Task[None] | None = None
-        while not self.state.done or not self._eval_queue.empty():
+        while True:
             try:
-                step = await asyncio.wait_for(self._eval_queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
+                step = self._eval_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if self.state.done:
+                    break
+                completed, step = await self._await_or_stop(self._eval_queue.get())
+                if not completed:
+                    continue
+            assert step is not None
 
             if pending_eval is not None and not pending_eval.done():
                 try:
@@ -555,35 +1142,112 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         sleep_seconds = min(1.0, max(0.2, self._status_log_interval_seconds / 10))
         while not self.state.done:
             self._status.log_if_due()
-            await asyncio.sleep(sleep_seconds)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=sleep_seconds)
+            except asyncio.TimeoutError:
+                continue
 
     async def _run_eval(self, step: int) -> None:
         assert self.eval_fn is not None
         self._status.note_val_started(step)
         reward: float | None = None
+        eval_elapsed = 0.0
+        eval_completed = False
         try:
-            result = await self.eval_fn(self.model, step, self.config)
-            splits: dict[str, list[art.Trajectory]]
-            if isinstance(result, dict):
-                splits = result
-            else:
-                splits = {"val": result}
+            token = self.model.activate_metrics_context("eval")
+            eval_started = time.monotonic()
+            try:
+                async with self._exact_adapter_lease(step):
+                    result = await self.eval_fn(self.model, step, self.config)
+            finally:
+                token.var.reset(token)
+                eval_elapsed = time.monotonic() - eval_started
+            splits = result if _is_eval_mapping(result) else {"val": result}
 
-            val_trajectories = splits.get("val") or []
-            if val_trajectories:
-                reward = sum(t.reward for t in val_trajectories) / len(val_trajectories)
-            else:
-                reward = None
-
-            for split_name, trajectories in splits.items():
-                if trajectories:
-                    await self.model.log(trajectories, split=split_name, step=step)
+            logged_eval_timing = False
+            for split_name, items in splits.items():
+                groups, trajectories = self._normalize_eval_items(items)
+                self._validate_eval_policy_spans(step, trajectories)
+                if split_name == "val":
+                    if trajectories:
+                        reward = sum(t.reward for t in trajectories) / len(trajectories)
+                    else:
+                        reward = None
+                if groups:
+                    metrics = (
+                        {"time/step_eval_s": eval_elapsed}
+                        if not logged_eval_timing
+                        else None
+                    )
+                    await self.model.log(
+                        groups,
+                        split=split_name,
+                        step=step,
+                        metrics=metrics,
+                    )
+                    logged_eval_timing = True
+            if not logged_eval_timing and eval_elapsed > 0:
+                await self.model.log(
+                    trajectories=None,
+                    split="val",
+                    step=step,
+                    metrics={"time/step_eval_s": eval_elapsed},
+                )
+            await self._log_checkpoint_eval_completed(step)
+            eval_completed = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"Eval failed at step {step}: {exc}")
         finally:
+            await self._release_scheduled_eval_lease(step)
+            if eval_completed:
+                self.state.completed_eval_steps.add(step)
+                self._persist_state(self.state.next_training_step)
             self._status.note_val_finished(step, reward)
+
+    @staticmethod
+    def _normalize_eval_items(
+        items: Sequence[art.Trajectory | art.TrajectoryGroup],
+    ) -> tuple[list[TrajectoryGroup], list[art.Trajectory]]:
+        if not items:
+            return [], []
+        groups: list[TrajectoryGroup] = []
+        loose: list[art.Trajectory] = []
+        for item in items:
+            if isinstance(item, TrajectoryGroup):
+                groups.append(item)
+            else:
+                loose.append(item)
+        if loose:
+            groups.append(TrajectoryGroup(loose))
+        trajectories: list[art.Trajectory] = []
+        for group in groups:
+            trajectories.extend(group.trajectories)
+        return groups, trajectories
+
+    @classmethod
+    def _validate_eval_policy_spans(
+        cls,
+        step: int,
+        trajectories: Iterable[art.Trajectory],
+    ) -> None:
+        for trajectory in trajectories:
+            for item in cls._trajectory_messages_and_choices(trajectory):
+                extra = getattr(item, "model_extra", None)
+                if not isinstance(extra, Mapping) or "policy_token_spans" not in extra:
+                    continue
+                spans = extra["policy_token_spans"]
+                if not isinstance(spans, list):
+                    raise RuntimeError("Eval policy_token_spans must be a list")
+                for span in spans:
+                    if not isinstance(span, Mapping) or "policy_version" not in span:
+                        raise RuntimeError("Eval policy token span is malformed")
+                    policy_version = int(span["policy_version"])
+                    if policy_version != step:
+                        raise RuntimeError(
+                            f"Eval at step {step} returned policy-{policy_version} tokens"
+                        )
 
     def _apply_policy_versions(
         self,
@@ -610,17 +1274,40 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 continue
             if not self._is_scalar_metadata(value):
                 continue
-            for trajectory in group.trajectories:
-                trajectory.metadata[f"scenario_{key}"] = value
+            if key == "scenario_id":
+                group.metadata["scenario_id"] = value
+                continue
+            group.metadata[f"scenario_{key}"] = value
 
-    def _is_group_stale(self, group: TrajectoryGroup, min_version: int) -> bool:
-        group_version = self._group_initial_version(group)
-        if group_version is None:
+    @staticmethod
+    def _scenario_error_context(scenario: ScenarioT) -> str:
+        metadata = scenario.get("metadata") if isinstance(scenario, dict) else None
+        if metadata is None or not isinstance(metadata, dict):
+            return ""
+        fields = (
+            f"{key}={metadata[key]!r}"
+            for key in ("scenario_id", "epoch", "scenario_index")
+            if key in metadata
+        )
+        context = " ".join(fields)
+        return f" [{context}]" if context else ""
+
+    def _is_group_stale(self, group: TrajectoryGroup, current_step: int) -> bool:
+        if self.max_steps_off_policy is not None:
+            group_version = self._group_initial_version(group)
+            if (
+                group_version is not None
+                and group_version < current_step - self.max_steps_off_policy
+            ):
+                return True
+        if self.limit_mean_steps_off_policy is None:
             return False
-        return group_version < min_version
+        mean_steps = self._group_mean_steps_off_policy(current_step, group)
+        return mean_steps is not None and mean_steps > self.limit_mean_steps_off_policy
 
     def _record_zero_variance(self, group: TrajectoryGroup) -> bool:
         self._discard_queue.append(group)
+        self.state.discarded_zero_variance_groups += 1
         self._status.note_zero_variance_discarded(1)
         if len(self._discard_queue) >= self._discard_queue_limit:
             self._trigger_collapse()
@@ -631,7 +1318,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if self._collapse_triggered:
             return
         self._collapse_triggered = True
-        self.state.done = True
+        self.request_stop()
         print(
             "\n"
             "========================================\n"
@@ -653,10 +1340,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             "\n"
         )
 
-    async def _log_discarded_groups(self, step: int) -> None:
+    async def _log_zero_variance_groups(self, step: int) -> None:
         if not self._discard_queue:
             return
-        discarded = list(self._discard_queue)
+        discarded = list(self._discard_queue[:50])
         await self.model.log(discarded, split="discarded", step=step)
         self._discard_queue.clear()
 
@@ -681,15 +1368,275 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     def _average_steps_off_policy(
         self, current_step: int, batch: list[TrajectoryGroup]
     ) -> float:
-        steps: list[int] = []
+        steps: list[float] = []
         for group in batch:
-            group_version = self._group_initial_version(group)
-            if group_version is None:
+            mean_steps = self._group_mean_steps_off_policy(current_step, group)
+            if mean_steps is None:
                 continue
-            steps.append(current_step - group_version)
+            steps.append(mean_steps)
         if not steps:
             return 0.0
         return sum(steps) / len(steps)
+
+    def _freshness_queue_window(self) -> int:
+        if self.max_steps_off_policy is not None:
+            return self.max_steps_off_policy
+        if self.limit_mean_steps_off_policy is not None:
+            return math.ceil(self.limit_mean_steps_off_policy)
+        return 1
+
+    def _queue_freshness_metrics(self, current_step: int) -> dict[str, float]:
+        if self._output_queue is None:
+            return {}
+        output_queue = cast(Any, self._output_queue)
+        queued = [
+            group
+            for group in list(output_queue._queue)
+            if isinstance(group, TrajectoryGroup)
+        ]
+        limit_raw = (
+            self.limit_mean_steps_off_policy
+            if self.limit_mean_steps_off_policy is not None
+            else self.max_steps_off_policy
+        )
+        if limit_raw is None:
+            limit_raw = 1.0
+        limit = max(float(limit_raw), 1e-9)
+        ages: list[float] = []
+        for group in queued:
+            if self.limit_mean_steps_off_policy is not None:
+                age = self._group_mean_steps_off_policy(current_step, group)
+            else:
+                initial = self._group_initial_version(group)
+                age = None if initial is None else float(current_step - initial)
+            if age is not None:
+                ages.append(float(age))
+        ready = float(len(queued))
+        stale = sum(1 for age in ages if age > limit)
+        return {
+            "queue/ready_groups_est": ready,
+            "queue/completed_backlog_groups": ready,
+            "queue/put_waiting_groups": 0.0,
+            "queue/groups_depth": ready,
+            "queue/groups_depth_max": float(self._output_queue.maxsize),
+            "queue/occupancy": ready / max(float(self._output_queue.maxsize), 1.0),
+            "queue/predicted_policy_age_mean_steps": sum(ages) / len(ages)
+            if ages
+            else 0.0,
+            "queue/predicted_policy_age_p95_steps": _weighted_percentile(
+                [(age, 1.0) for age in ages], 0.95
+            )
+            if ages
+            else 0.0,
+            "queue/freshness_pressure": (sum(ages) / len(ages) / limit)
+            if ages
+            else 0.0,
+            "queue/predicted_stale_fraction": stale / len(ages) if ages else 0.0,
+        }
+
+    def _pipeline_settings_metrics(self) -> dict[str, float]:
+        if self.autotune.mode == "off":
+            return {}
+        return {
+            "pipeline_settings/num_rollout_workers": float(self.num_rollout_workers),
+            "pipeline_settings/min_batch_size": float(self.min_batch_size),
+            "pipeline_settings/max_batch_size": float(self.max_batch_size),
+            "pipeline_settings/target_groups_per_step": float(
+                self.target_groups_per_step
+            ),
+            "pipeline_settings/queue_maxsize": float(self.queue_maxsize or 0),
+        }
+
+    def _retention_window_steps(self) -> int:
+        if self.max_steps_off_policy is not None:
+            return self.max_steps_off_policy
+        if self.limit_mean_steps_off_policy is not None:
+            return math.ceil(self.limit_mean_steps_off_policy)
+        return 0
+
+    def _group_mean_steps_off_policy(
+        self, current_step: int, group: TrajectoryGroup
+    ) -> float | None:
+        weighted_age_sum = 0.0
+        weight_sum = 0.0
+        for trajectory in group.trajectories:
+            stats = self._trajectory_policy_age_stats(current_step, trajectory)
+            if stats is None:
+                continue
+            age_sum, weight, _age_exp_sum = stats
+            weighted_age_sum += age_sum
+            weight_sum += weight
+        if weight_sum <= 0:
+            return None
+        return weighted_age_sum / weight_sum
+
+    def _score_metrics(
+        self,
+        current_step: int,
+        batch: list[TrajectoryGroup],
+        *,
+        step_seconds: float,
+        result_metrics: dict[str, float],
+    ) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        accepted_groups = float(len(batch))
+        metrics["sample_efficiency/accepted_groups_per_step"] = accepted_groups
+        rollouts_per_group = self._batch_rollouts_per_group(batch)
+        batch_factor = self._batch_factor(
+            accepted_groups=accepted_groups,
+            rollouts_per_group=rollouts_per_group,
+        )
+        metrics["sample_efficiency/batch_factor"] = batch_factor
+
+        age_metrics = self._batch_policy_age_metrics(current_step, batch)
+        age_exp_moment = age_metrics.pop("_policy_age_exp_tau8", None)
+        metrics.update(age_metrics)
+        mean_age = age_metrics.get("offpolicy/token_weighted_policy_age_steps")
+        if mean_age is None or age_exp_moment is None:
+            return metrics
+        freshness = 1.0 / max(float(age_exp_moment), 1e-12)
+        metrics["sample_efficiency/freshness_discount"] = freshness
+
+        assistant_tokens = result_metrics.get(
+            "data/step_trainable_assistant_tokens",
+        )
+        if assistant_tokens is not None and step_seconds > 0:
+            accepted_tok_per_s = float(assistant_tokens) / step_seconds
+            metrics["throughput/accepted_train_tok_per_s"] = accepted_tok_per_s
+            metrics["objective/score"] = accepted_tok_per_s * freshness * batch_factor
+        return metrics
+
+    def _batch_rollouts_per_group(self, batch: list[TrajectoryGroup]) -> float | None:
+        group_sizes = [len(group.trajectories) for group in batch]
+        if not group_sizes:
+            return None
+        return sum(group_sizes) / len(group_sizes)
+
+    def _reference_rollouts_per_group(
+        self, rollouts_per_group: float | None
+    ) -> float | None:
+        if self.score_reference_rollouts_per_group is not None:
+            return self.score_reference_rollouts_per_group
+        return rollouts_per_group
+
+    def _batch_factor(
+        self,
+        *,
+        accepted_groups: float,
+        rollouts_per_group: float | None,
+    ) -> float:
+        if (
+            self.score_reference_groups_per_step is None
+            or accepted_groups <= 0
+            or rollouts_per_group is None
+            or rollouts_per_group <= 0
+        ):
+            return 1.0
+        reference_rollouts = self._reference_rollouts_per_group(rollouts_per_group)
+        if reference_rollouts is None or reference_rollouts <= 0:
+            return 1.0
+        reference_scenario_data = (
+            self.score_reference_groups_per_step
+            + _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE / reference_rollouts
+        )
+        current_scenario_data = (
+            accepted_groups + _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE / rollouts_per_group
+        )
+        return reference_scenario_data / current_scenario_data
+
+    def _batch_policy_age_metrics(
+        self, current_step: int, batch: list[TrajectoryGroup]
+    ) -> dict[str, float]:
+        weighted_ages: list[tuple[float, float]] = []
+        unweighted_ages: list[float] = []
+        age_sum = 0.0
+        age_exp_sum = 0.0
+        weight_sum = 0.0
+        for group in batch:
+            for trajectory in group.trajectories:
+                stats = self._trajectory_policy_age_stats(current_step, trajectory)
+                if stats is None:
+                    continue
+                trajectory_age_sum, weight, trajectory_age_exp_sum = stats
+                if weight <= 0:
+                    continue
+                age = trajectory_age_sum / weight
+                age_sum += trajectory_age_sum
+                age_exp_sum += trajectory_age_exp_sum
+                weight_sum += weight
+                weighted_ages.append((age, weight))
+                unweighted_ages.append(age)
+        if weight_sum <= 0 or not weighted_ages:
+            return {}
+        return {
+            "offpolicy/token_weighted_policy_age_steps": age_sum / weight_sum,
+            "_policy_age_exp_tau8": age_exp_sum / weight_sum,
+            "offpolicy/token_weighted_policy_age_p95_steps": _weighted_percentile(
+                weighted_ages, 0.95
+            ),
+        }
+
+    def _trajectory_policy_age_stats(
+        self, current_step: int, trajectory: art.Trajectory
+    ) -> tuple[float, float, float] | None:
+        span_stats = self._trajectory_policy_span_age_stats(current_step, trajectory)
+        if span_stats is not None:
+            return span_stats
+        if trajectory.initial_policy_version is None:
+            return None
+        weight = self._trajectory_completion_weight(trajectory)
+        age = float(current_step - trajectory.initial_policy_version)
+        return age * weight, weight, _policy_age_exp(age) * weight
+
+    def _trajectory_policy_span_age_stats(
+        self, current_step: int, trajectory: art.Trajectory
+    ) -> tuple[float, float, float] | None:
+        age_sum = 0.0
+        age_exp_sum = 0.0
+        weight_sum = 0.0
+        for item in self._trajectory_messages_and_choices(trajectory):
+            extra = getattr(item, "model_extra", None)
+            if not isinstance(extra, Mapping):
+                continue
+            spans = extra.get("policy_token_spans")
+            if not isinstance(spans, list):
+                continue
+            for span in spans:
+                if not isinstance(span, Mapping):
+                    continue
+                try:
+                    policy_version = int(span["policy_version"])
+                    weight = int(span["end_token"]) - int(span["start_token"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if weight <= 0:
+                    continue
+                age = float(current_step - policy_version)
+                age_sum += age * weight
+                age_exp_sum += _policy_age_exp(age) * weight
+                weight_sum += float(weight)
+        if weight_sum <= 0:
+            return None
+        return age_sum, weight_sum, age_exp_sum
+
+    @staticmethod
+    def _trajectory_messages_and_choices(trajectory: art.Trajectory) -> Iterable[Any]:
+        for exchange in trajectory.exchanges.chat_completions:
+            yield from exchange.response.choices
+        yield from trajectory.messages_and_choices
+        for history in trajectory.additional_histories:
+            yield from history.messages_and_choices
+
+    @staticmethod
+    def _trajectory_completion_weight(trajectory: art.Trajectory) -> float:
+        value = trajectory.metrics.get("completion_tokens")
+        if not isinstance(value, bool) and isinstance(value, int | float) and value > 0:
+            return float(value)
+        raise RuntimeError(
+            "Pipeline training requires a positive completion_tokens metric from "
+            "serving response usage; received "
+            f"{value!r}"
+        )
 
     def _should_eval_step(self, step: int) -> bool:
         if self.eval_fn is None:
@@ -708,19 +1655,199 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             "total_scenarios_consumed": self.state.total_scenarios_consumed,
             "training_step": training_step,
             "last_eval_step": self.state.last_eval_step,
+            "completed_eval_steps": sorted(self.state.completed_eval_steps),
+            "accepted_trainable_groups": self.state.accepted_trainable_groups,
+            "discarded_stale_groups": self.state.discarded_stale_groups,
+            "discarded_zero_variance_groups": (
+                self.state.discarded_zero_variance_groups
+            ),
         }
+        if self._pipeline_tuner_profile is not None:
+            payload["pipeline_tuner_profile"] = self._pipeline_tuner_profile
         self.model.merge_state({PIPELINE_STATE_KEY: payload})
+
+    def _log_checkpoint_history(self, step: int, metrics: dict[str, float]) -> None:
+        row: dict[str, int | float | str] = {
+            (key if key.startswith("checkpoint/") else f"checkpoint/{key}"): value
+            for key, value in metrics.items()
+            if value == value
+        }
+        if not row:
+            return
+        row["training_step"] = step
+        row["step"] = step
+        row["recorded_at"] = datetime.now().isoformat()
+
+        output_dir = self.model._get_output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        with open(Path(output_dir) / "history.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+
+    async def _log_checkpoint_saved(self, result: Any) -> None:
+        step = int(result.step)
+        checkpoint_path = getattr(result, "checkpoint_path", None)
+        path = (
+            Path(checkpoint_path)
+            if isinstance(checkpoint_path, str) and checkpoint_path
+            else Path(self.model._get_output_dir()) / "checkpoints" / f"{step:04d}"
+        )
+        if not path.exists():
+            return
+        self._log_checkpoint_history(
+            step,
+            {
+                CHECKPOINT_SAVED_METRIC: 1.0,
+                CHECKPOINT_CREATED_AT_METRIC: path.stat().st_ctime,
+            },
+        )
+
+    async def _log_checkpoint_eval_completed(self, step: int) -> None:
+        self._log_checkpoint_history(
+            step,
+            {CHECKPOINT_EVAL_COMPLETED_METRIC: 1.0},
+        )
+
+    def _checkpoint_metrics_by_step(self) -> dict[int, dict[str, float]]:
+        history_path = Path(self.model._get_output_dir()) / "history.jsonl"
+        if not history_path.exists():
+            return {}
+        sums: dict[int, dict[str, float]] = {}
+        counts: dict[int, dict[str, int]] = {}
+        with history_path.open("r", encoding="utf-8") as history_file:
+            for line in history_file:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                step = row.get("step")
+                if not isinstance(step, int):
+                    continue
+                for key, value in row.items():
+                    if key in {"step", "recorded_at"}:
+                        continue
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        continue
+                    step_sums = sums.setdefault(step, {})
+                    step_counts = counts.setdefault(step, {})
+                    step_sums[key] = step_sums.get(key, 0.0) + float(value)
+                    step_counts[key] = step_counts.get(key, 0) + 1
+        return {
+            step: {
+                key: value / counts[step][key]
+                for key, value in step_sums.items()
+                if counts[step][key] > 0
+            }
+            for step, step_sums in sums.items()
+        }
+
+    def _checkpoint_infos(self) -> list[CheckpointInfo]:
+        checkpoint_dir = Path(self.model._get_output_dir()) / "checkpoints"
+        if not checkpoint_dir.exists():
+            return []
+        metrics_by_step = self._checkpoint_metrics_by_step()
+        checkpoints: list[CheckpointInfo] = []
+        for path in checkpoint_dir.iterdir():
+            if not path.is_dir() or not path.name.isdigit():
+                continue
+            step = int(path.name)
+            stat = path.stat()
+            metrics = metrics_by_step.get(step, {})
+            created_at_unix = metrics.get(CHECKPOINT_CREATED_AT_METRIC)
+            created_at = (
+                datetime.fromtimestamp(created_at_unix, timezone.utc)
+                if created_at_unix is not None
+                else datetime.fromtimestamp(stat.st_ctime, timezone.utc)
+            )
+            checkpoints.append(
+                CheckpointInfo(
+                    step=step,
+                    path=str(path),
+                    created_at=created_at,
+                    is_eval_step=(
+                        step in self.state.completed_eval_steps
+                        or metrics.get(CHECKPOINT_EVAL_COMPLETED_METRIC, 0.0) > 0.0
+                        or any(key.startswith(("val/", "test/")) for key in metrics)
+                    ),
+                    metrics=metrics,
+                )
+            )
+        return sorted(checkpoints, key=lambda checkpoint: checkpoint.step)
+
+    def _protected_checkpoint_steps(self, current_step: int) -> set[int]:
+        protected_steps = (
+            {current_step}
+            | set(self._checkpoint_lease_counts)
+            | set(self._scheduled_eval_steps)
+        )
+        if self.kl_penalty_coef > 0.0:
+            if self.kl_penalty_step_lag is None:
+                protected_steps.add(0)
+            else:
+                kl_penalty_reference_step = self._kl_penalty_reference_step(
+                    current_step
+                )
+                protected_steps.update(
+                    range(kl_penalty_reference_step, current_step + 1)
+                )
+        return protected_steps
+
+    async def _run_checkpoint_retention(self, current_step: int) -> None:
+        strategy = self.checkpoint_retention_strategy
+        if strategy is None:
+            return
+        if current_step % self.checkpoint_retention_interval != 0:
+            return
+        all_checkpoints = self._checkpoint_infos()
+        if not all_checkpoints:
+            return
+        protected_steps = self._protected_checkpoint_steps(current_step)
+        eligible = [
+            checkpoint
+            for checkpoint in all_checkpoints
+            if checkpoint.step not in protected_steps
+        ]
+        if not eligible:
+            return
+        context = CheckpointRetentionContext(
+            current_step=current_step,
+            checkpoints=eligible,
+        )
+        eligible_steps = {checkpoint.step for checkpoint in eligible}
+        keep_eligible_steps = set(strategy(context)) & eligible_steps
+        delete_steps = eligible_steps - keep_eligible_steps
+        if not delete_steps:
+            return
+        keep_steps = {checkpoint.step for checkpoint in all_checkpoints} - delete_steps
+        await self.backend._delete_checkpoint_files(self.model, sorted(keep_steps))
 
     @staticmethod
     def _is_scalar_metadata(value: object) -> bool:
         return value is None or isinstance(value, (str, int, float, bool))
 
-    async def _put_output_group(self, group: TrajectoryGroup) -> None:
+    async def _put_output_group(self, group: TrajectoryGroup) -> float:
         assert self._output_queue is not None
-        while not self.state.done:
-            try:
-                await asyncio.wait_for(self._output_queue.put(group), timeout=1.0)
-                self._status.note_group_enqueued(group)
-                return
-            except asyncio.TimeoutError:
-                continue
+        queue_wait_started = time.monotonic()
+        completed, _ = await self._await_or_stop(self._output_queue.put(group))
+        if completed:
+            self._status.note_group_enqueued(group)
+        return time.monotonic() - queue_wait_started
+
+    def _record_producer_rollout_timings(
+        self, rollout_wall_s: float, actor_idle_s: float, queue_wait_s: float
+    ) -> None:
+        previous = self._producer_rollout_timings
+        self._producer_rollout_timings = (
+            previous[0] + rollout_wall_s,
+            previous[1] + actor_idle_s,
+            previous[2] + queue_wait_s,
+        )
+
+    def _consume_producer_rollout_timings(self) -> tuple[float, float, float]:
+        current = self._producer_rollout_timings
+        previous = self._reported_producer_rollout_timings
+        self._reported_producer_rollout_timings = current
+        return (
+            max(0.0, current[0] - previous[0]),
+            max(0.0, current[1] - previous[1]),
+            max(0.0, current[2] - previous[2]),
+        )

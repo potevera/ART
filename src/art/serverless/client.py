@@ -20,6 +20,7 @@ from openai.pagination import AsyncCursorPage
 from typing_extensions import override
 
 from ..trajectories import TrajectoryGroup
+from ..types import SFTMetricLoggingConfig
 
 ResponseT = TypeVar("ResponseT")
 
@@ -30,6 +31,7 @@ class Model(BaseModel):
     project: str
     name: str
     base_model: str
+    run_id: str | None
 
 
 class Checkpoint(BaseModel):
@@ -51,21 +53,45 @@ class DeleteCheckpointsResponse(BaseModel):
 
 class ExperimentalTrainingConfig(TypedDict, total=False):
     advantage_balance: float | None
+    allow_training_without_logprobs: bool | None
     epsilon: float | None
     epsilon_high: float | None
     importance_sampling_level: (
         Literal["token", "sequence", "average", "geometric_average"] | None
     )
     kimi_k2_tau: float | None
+    kl_penalty_coef: float | None
+    kl_penalty_reference_step: int | None
+    kl_penalty_source: Literal["current_learner", "sample"] | None
+    kl_penalty_step_lag: int | None
+    kl_ref_adapter_path: str | None
     learning_rate: float | None
+    logprob_calculation_chunk_size: int | None
+    loss_fn: Literal["cispo", "ppo"] | None
     mask_prob_ratio: bool | None
     max_negative_advantage_importance_sampling_weight: float | None
+    normalize_advantages: bool | None
+    num_trajectories_learning_rate_multiplier_power: float | None
+    packed_sequence_length: int | None
+    plot_tensors: bool | None
     ppo: bool | None
     precalculate_logprobs: bool | None
+    scale_learning_rate_by_reward_std_dev: bool | None
     scale_rewards: bool | None
+    truncated_importance_sampling: float | None
+
+
+class SFTTrainingConfig(TypedDict, total=False):
+    batch_size: int | None
+    learning_rate: float | list[float] | None
+    metric_logging: SFTMetricLoggingConfig | None
 
 
 class TrainingJob(BaseModel):
+    id: str
+
+
+class SFTTrainingJob(BaseModel):
     id: str
 
 
@@ -116,7 +142,7 @@ class Models(AsyncAPIResource):
             body={
                 "model_id": model_id,
                 "trajectory_groups": [
-                    trajectory_group.model_dump()
+                    trajectory_group.model_dump(mode="json")
                     for trajectory_group in trajectory_groups
                 ],
                 "split": split,
@@ -220,6 +246,29 @@ class TrainingJobEvents(AsyncAPIResource):
         )
 
 
+class SFTTrainingJobs(AsyncAPIResource):
+    async def create(
+        self,
+        *,
+        model_id: str,
+        training_data_url: str,
+        config: SFTTrainingConfig | None = None,
+    ) -> SFTTrainingJob:
+        return await self._post(
+            "/preview/sft-training-jobs",
+            cast_to=SFTTrainingJob,
+            body={
+                "model_id": model_id,
+                "training_data_url": training_data_url,
+                "config": config,
+            },
+        )
+
+    @cached_property
+    def events(self) -> "TrainingJobEvents":
+        return TrainingJobEvents(cast(AsyncOpenAI, self._client))  # ty:ignore[redundant-cast]
+
+
 class Client(AsyncAPIClient):
     api_key: str
 
@@ -264,6 +313,10 @@ class Client(AsyncAPIClient):
     def training_jobs(self) -> TrainingJobs:
         return TrainingJobs(cast(AsyncOpenAI, self))
 
+    @cached_property
+    def sft_training_jobs(self) -> SFTTrainingJobs:
+        return SFTTrainingJobs(cast(AsyncOpenAI, self))
+
     ############################
     # AsyncOpenAI overrides #
     ############################
@@ -278,6 +331,9 @@ class Client(AsyncAPIClient):
     def auth_headers(self) -> dict[str, str]:
         api_key = self.api_key
         return {"Authorization": f"Bearer {api_key}"}
+
+    def _auth_headers(self, security: Any | None = None) -> dict[str, str]:  # noqa: ARG002
+        return self.auth_headers
 
     @property
     @override

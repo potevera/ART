@@ -19,7 +19,7 @@ import polars as pl
 import art
 from art.tinker_native import TinkerNativeBackend
 
-from . import PipelineTrainer, make_group_rollout_fn
+from . import PipelineRuntimeConfig, PipelineTrainer, make_group_rollout_fn
 
 Scenario = dict[str, Any]
 
@@ -148,7 +148,7 @@ def extract_guess(choice: Any) -> tuple[str | None, str]:
 
 
 def get_model_output_dir(model: art.TrainableModel) -> Path:
-    return Path(model.base_path) / model.project / "models" / model.name
+    return Path(model.base_path) / model.project / "models" / model.run_name
 
 
 def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
@@ -165,7 +165,7 @@ def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
         step = row["step"]
         reward = row["train/reward"]
         std_dev = row["train/reward_std_dev"]
-        discarded = row["train/discarded_stale_samples"]
+        discarded = row["train/discarded_stale_groups"]
         off_policy = row["train/steps_off_policy"]
         print(
             f"  step={step} reward={reward} std={std_dev} "
@@ -192,7 +192,7 @@ async def main() -> None:
     max_batch_size_env = os.environ.get("MAX_BATCH_SIZE")
     max_batch_size = int(max_batch_size_env) if max_batch_size_env else None
     eval_every_n_steps = int(os.environ.get("EVAL_EVERY_N_STEPS", "2"))
-    eval_step_0 = os.environ.get("EVAL_STEP_0", "1") == "1"
+    eval_at_start = os.environ.get("EVAL_AT_START", "1") == "1"
     max_steps = int(os.environ.get("MAX_STEPS", "10"))
     save_checkpoint = os.environ.get("SAVE_CHECKPOINT", "0") == "1"
     resume_env = os.environ.get("RESUME")
@@ -219,28 +219,34 @@ async def main() -> None:
 
     backend = TinkerNativeBackend(path=art_path)
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project=project,
         base_model=base_model,
         _internal_config=internal_config,
-        report_metrics=[],  # Disable wandb logging
     )
     await model.register(backend)
 
     openai_client = model.openai_client()
+    cost_calculator = model.cost_calculator
 
-    async def do_rollout(scenario: Scenario, temp: float) -> art.Trajectory:
+    async def do_rollout(
+        scenario: Scenario, temp: float, cost_context: str
+    ) -> art.Trajectory:
         """Core rollout logic used by both training and eval."""
         messages: art.Messages = scenario["messages"]
         response = await openai_client.chat.completions.create(
             messages=messages,
-            model=model.name,
+            model=model.get_inference_name(),
             max_tokens=max_tokens,
             timeout=request_timeout,
             temperature=temp,
             tools=TOOLS,
             tool_choice=TOOL_CHOICE,
         )
+        usage = getattr(response, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         choice = response.choices[0]
         raw_guess, source = extract_guess(choice)
         sampled_content = choice.message.content or ""
@@ -259,6 +265,13 @@ async def main() -> None:
             "tool_call_found": 1.0 if source != "missing" else 0.0,
             "tool_call_structured": 1.0 if source == "tool_call" else 0.0,
         }
+        sample_costs = cost_calculator(
+            prompt_tokens,
+            completion_tokens,
+            cost_context,
+        )
+        if sample_costs:
+            metrics.update(sample_costs)
         return art.Trajectory(
             messages_and_choices=[*messages, choice],
             tools=TOOLS,
@@ -272,7 +285,7 @@ async def main() -> None:
         scenario: Scenario,
         _config: PipelineConfig,
     ) -> art.Trajectory:
-        return await do_rollout(scenario, temperature)
+        return await do_rollout(scenario, temperature, "train")
 
     rollout_fn = make_group_rollout_fn(single_rollout, n=rollouts_per_scenario)
 
@@ -281,7 +294,7 @@ async def main() -> None:
     async def eval_fn(
         _model: art.TrainableModel, _step: int, _config: PipelineConfig
     ) -> list[art.Trajectory]:
-        tasks = [do_rollout(build_scenario(), eval_temperature)]
+        tasks = [do_rollout(build_scenario(), eval_temperature, "eval")]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         trajectories = [r for r in results if isinstance(r, art.Trajectory)]
         if trajectories:
@@ -303,7 +316,7 @@ async def main() -> None:
     async def scenario_iter():
         for i in range(scenario_count):
             scenario = build_scenario()
-            scenario["metadata"] = {"scenario_idx": i}
+            scenario["metadata"] = {"scenario_id": str(i)}
             yield scenario
 
     config = PipelineConfig(
@@ -319,14 +332,16 @@ async def main() -> None:
         scenarios=scenario_iter(),
         config=config,
         eval_fn=eval_fn,
-        num_rollout_workers=num_rollout_workers,
-        min_batch_size=min_batch_size,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=num_rollout_workers,
+            min_batch_size=min_batch_size,
+            max_batch_size=max_batch_size,
+        ),
         max_steps_off_policy=max_steps_off_policy,
-        max_batch_size=max_batch_size,
         learning_rate=float(os.environ.get("LEARNING_RATE", "1e-4")),
         log_interval_seconds=log_interval_seconds,
         eval_every_n_steps=eval_every_n_steps,
-        eval_step_0=eval_step_0,
+        eval_at_start=eval_at_start,
         save_checkpoint=save_checkpoint,
         resume=resume,
         max_steps=max_steps,

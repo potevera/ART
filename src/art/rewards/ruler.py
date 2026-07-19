@@ -11,7 +11,6 @@ For detailed documentation and examples, see: https://art.openpipe.ai/fundamenta
 
 import json
 from textwrap import dedent
-from typing import List
 
 from litellm import acompletion
 from litellm.types.utils import ModelResponse
@@ -35,7 +34,7 @@ class TrajectoryScore(BaseModel):
 class Response(BaseModel):
     """Response format expected from the LLM judge."""
 
-    scores: List[TrajectoryScore] = Field(description="The scores for each trajectory.")
+    scores: list[TrajectoryScore] = Field(description="The scores for each trajectory.")
 
 
 DEFAULT_RUBRIC = dedent(
@@ -50,11 +49,46 @@ DEFAULT_RUBRIC = dedent(
 as RULER extracts task understanding from the system prompts in the trajectories."""
 
 
+def _judge_provider(judge_model: str) -> str | None:
+    provider, separator, _ = judge_model.partition("/")
+    if not separator:
+        return None
+    normalized_provider = provider.strip().lower()
+    if not normalized_provider:
+        return None
+    return normalized_provider
+
+
+def _record_ruler_cost(judge_model: str, response: ModelResponse) -> None:
+    provider = _judge_provider(judge_model)
+    if provider is None:
+        return
+
+    try:
+        from art.metrics import MetricsBuilder
+
+        builder = MetricsBuilder.get_active()
+    except LookupError:
+        return
+
+    try:
+        builder.add_response_cost(
+            "judge/ruler",
+            response,
+            provider=provider,
+            model_name=judge_model,
+        )
+    except ValueError:
+        # RULER supports local and custom LiteLLM models that may not have pricing.
+        return
+
+
 async def ruler(
     message_lists: list[list[ChatCompletionMessageParam]],
     judge_model: str = "openai/o3",
-    extra_litellm_params: dict | None = None,
+    extra_litellm_params: dict[str, object] | None = None,
     rubric: str = DEFAULT_RUBRIC,
+    tools: art.Tools | None = None,
     *,
     debug: bool = False,
 ) -> list[TrajectoryScore]:
@@ -78,9 +112,14 @@ async def ruler(
             - "openai/gpt-4o-mini" - Fast and cost-effective
             - "openai/o3" - Most capable but expensive (default)
             - "anthropic/claude-3-opus-20240229" - Alternative judge
+            - "ollama/qwen3:32b" - Local Ollama judge via LiteLLM
+            The default calls OpenAI through LiteLLM. Set this explicitly for
+            local or custom judge backends.
         extra_litellm_params: Additional parameters to pass to LiteLLM completion.
             Can include temperature, max_tokens, etc.
         rubric: The grading rubric. The default rubric works well for most tasks.
+        tools: Optional list of tool definitions available to the agent. When provided,
+            the judge will see which tools were available when evaluating tool usage.
         debug: If True, pretty-print the judge's reasoning to help understand scores.
 
     Returns:
@@ -137,9 +176,15 @@ async def ruler(
             "<context>\n" + json.dumps(common_prefix_messages) + "\n</context>\n\n"
         )
 
+    # Include available tools so the judge knows which tool calls are valid
+    if tools:
+        user_text += (
+            "<available_tools>\n" + json.dumps(tools) + "\n</available_tools>\n\n"
+        )
+
     # Serialize each trajectory (minus the common prefix) for the judge.
     # If all trajectories are identical, only serialize one full trajectory to save tokens.
-    serialized_trajectories: List[str] = []
+    serialized_trajectories: list[str] = []
     if all_identical:
         # Send the full trajectory since they're all identical
         full_trajectory = message_lists[0]
@@ -180,6 +225,7 @@ async def ruler(
         **extra_litellm_params if extra_litellm_params else {},
     )
     assert isinstance(response, ModelResponse)
+    _record_ruler_cost(judge_model, response)
 
     if len(response.choices) == 0:
         raise ValueError(f"No choices in response: {response}")
@@ -220,7 +266,7 @@ async def ruler(
 async def ruler_score_group(
     group: art.TrajectoryGroup,
     judge_model: str = "openai/o3",
-    extra_litellm_params: dict | None = None,
+    extra_litellm_params: dict[str, object] | None = None,
     rubric: str = DEFAULT_RUBRIC,
     *,
     swallow_exceptions: bool = False,
@@ -274,6 +320,7 @@ async def ruler_score_group(
     for t in group.trajectories:
         # Create a new trajectory with the same data but fresh objects
         new_traj = t.__class__(
+            exchanges=t.exchanges.model_copy(deep=True),
             messages_and_choices=t.messages_and_choices.copy(),
             tools=t.tools.copy() if t.tools else None,
             additional_histories=[
@@ -286,19 +333,25 @@ async def ruler_score_group(
         )
         new_trajectories.append(new_traj)
 
-    # Extract message lists and preserve original rewards for comparison
-    message_lists: list[list[ChatCompletionMessageParam]] = []
-    for traj in new_trajectories:
-        message_lists.append(traj.messages())
-        traj.metrics["independent_reward"] = traj.reward
+    for trajectory in new_trajectories:
+        trajectory.metrics["independent_reward"] = trajectory.reward
 
     try:
+        histories = [
+            trajectory.history().as_chat_completions_history()
+            for trajectory in new_trajectories
+        ]
+        message_lists: list[list[ChatCompletionMessageParam]] = [
+            history.messages for history in histories
+        ]
+        tools = histories[0].tools if histories else None
         # Call the core ruler function to get scores
         scores = await ruler(
             message_lists,
             judge_model=judge_model,
             extra_litellm_params=extra_litellm_params,
             rubric=rubric,
+            tools=tools,
             debug=debug,
         )
     except Exception as e:

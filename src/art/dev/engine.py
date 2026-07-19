@@ -3,6 +3,10 @@ from typing import Any, Literal, Tuple
 from typing_extensions import TypedDict
 
 
+class WeightTransferConfig(TypedDict):
+    backend: Literal["nccl"]
+
+
 class EngineArgs(TypedDict, total=False):
     model: str
     served_model_name: str | list[str] | None
@@ -30,7 +34,6 @@ class EngineArgs(TypedDict, total=False):
     block_size: int | None
     enable_prefix_caching: bool | None
     disable_sliding_window: bool
-    use_v2_block_manager: bool
     swap_space: float  # GiB
     cpu_offload_gb: float  # GiB
     gpu_memory_utilization: float
@@ -68,13 +71,12 @@ class EngineArgs(TypedDict, total=False):
     max_prompt_adapters: int
     max_prompt_adapter_token: int
     fully_sharded_loras: bool
+    lora_target_modules: list[str]
     lora_extra_vocab_size: int
     long_lora_scaling_factors: Tuple[float] | None
     lora_dtype: str | None
     max_cpu_loras: int | None
     device: str
-    num_scheduler_steps: int
-    multi_step_stream_outputs: bool
     ray_workers_use_nsight: bool
     num_gpu_blocks_override: int | None
     num_lookahead_slots: int
@@ -119,11 +121,14 @@ class EngineArgs(TypedDict, total=False):
     generation_config: str | None
     override_generation_config: dict[str, Any] | None
     enable_sleep_mode: bool
+    enable_expert_parallel: bool
+    enable_return_routed_experts: bool
     model_impl: str
 
     calculate_kv_scales: bool | None
 
     additional_config: dict[str, Any] | None
+    weight_transfer_config: WeightTransferConfig | None
 
     disable_log_requests: (
         bool  # Deprecated in vLLM 0.13+, use enable_log_requests instead

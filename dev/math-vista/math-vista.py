@@ -34,6 +34,7 @@ async def main(model_name: str, steps: int) -> None:
 
     # Initialize trainable model and backend
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project="math-vista",
         base_model="Qwen/Qwen2.5-VL-7B-Instruct",
@@ -61,7 +62,7 @@ async def main(model_name: str, steps: int) -> None:
         ]
 
         chat_completion = await client.chat.completions.create(
-            model=model.name, messages=trajectory.messages()
+            model=model.get_inference_name(), messages=trajectory.messages()
         )
         choice = chat_completion.choices[0]
         trajectory.messages_and_choices.append(choice)

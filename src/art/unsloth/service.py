@@ -1,139 +1,72 @@
 """Unsloth training service with decoupled vLLM inference."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
+import logging
 import os
-from typing import TYPE_CHECKING, Any, AsyncIterator, Protocol, cast
+import socket
+from typing import Any, AsyncIterator, Literal, TypedDict, cast
 
-from datasets import Dataset
-import peft
 import torch
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils.dummy_pt_objects import GenerationMixin, PreTrainedModel
-from trl import GRPOConfig, GRPOTrainer
-from vllm import AsyncEngineArgs
-from vllm.lora.request import LoRARequest
-from vllm.v1.engine.async_llm import AsyncLLM
+from trl import GRPOTrainer
 
 from .. import dev, types
+from ..adapter_leases import in_flight_lora_name
+from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
-from ..preprocessing.inputs import TrainInputs, create_train_inputs
-from ..preprocessing.pack import (
-    DiskPackedTensors,
-    PackedTensors,
-    packed_tensors_from_dir,
+from ..preprocessing.inputs import TrainInputs
+from ..preprocessing.pack import DiskPackedTensors
+from ..preprocessing.tokenize import SFTBatch
+from ..serving_capabilities import (
+    ServingCapabilities,
+    discover_serving_capabilities,
 )
+from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
+from ..utils.lifecycle import (
+    ChildProcessSupervisor,
+    ServiceLifecycle,
+    cleanup_after_failure,
+)
 from ..utils.output_dirs import get_step_checkpoint_dir
-from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
-from .train import gc_and_empty_cuda_cache, train
+from ..vllm_runtime import (
+    ManagedVllmRuntime,
+    VllmRuntimeLaunchConfig,
+)
+from ..weight_transfer import (
+    DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+    DEFAULT_PACKED_NUM_BUFFERS,
+    trainer_init,
+    trainer_send_weights,
+)
+from .train import (
+    UnslothTrainContext,
+    create_unsloth_train_context,
+    gc_and_empty_cuda_cache,
+    run_unsloth_rl_training,
+    run_unsloth_sft_training,
+)
 
-if TYPE_CHECKING:
-    from peft.peft_model import PeftModelForCausalLM
-    from trl import GRPOTrainer
-
-
-# ============================================================================
-# Shared Utilities
-# ============================================================================
-
-
-class SupportsLoadLora(Protocol):
-    """Protocol for models that support the optimized load_lora method."""
-
-    def load_lora(self, lora_path: str, load_tensors: bool = True) -> LoRARequest: ...
-
-
-def precalculate_new_logprobs(
-    trainer: "GRPOTrainer",
-    peft_model: "PeftModelForCausalLM",
-    packed_tensors: PackedTensors,
-    config: types.TrainConfig,
-    _config: dev.TrainConfig,
-) -> torch.Tensor:
-    """Precalculate logprobs for all offsets and return as a tensor."""
-    return torch.cat(
-        [
-            trainer.compute_loss(
-                peft_model,
-                TrainInputs(  # ty:ignore[missing-typed-dict-key]
-                    **{
-                        k: v[_offset : _offset + 1]
-                        for k, v in packed_tensors.items()
-                        if isinstance(v, torch.Tensor)
-                    },
-                    pixel_values=packed_tensors["pixel_values"][_offset : _offset + 1],
-                    image_grid_thw=packed_tensors["image_grid_thw"][
-                        _offset : _offset + 1
-                    ],
-                    config=config,
-                    _config=_config,
-                    return_new_logprobs=True,
-                ),
-            )
-            for _offset in range(0, packed_tensors["tokens"].shape[0])
-        ]
-    ).to("cpu")
+logger = logging.getLogger(__name__)
 
 
-async def process_train_batch(
-    packed_tensors: PackedTensors,
-    config: types.TrainConfig,
-    _config: dev.TrainConfig,
-    inputs_queue: asyncio.Queue[TrainInputs],
-    results_queue: asyncio.Queue[dict[str, float]],
-    train_task: asyncio.Task[None],
-    trainer: "GRPOTrainer",
-    peft_model: "PeftModelForCausalLM",
-    warmup: bool,
-    verbose: bool = False,
-):
-    """
-    Process training batches and yield results.
+def _peft_args_from_lora_config(lora_config: dev.LoRAConfig) -> dict[str, Any]:
+    aliases = {
+        "rank": "r",
+        "alpha": "lora_alpha",
+        "dropout": "lora_dropout",
+        "init_weights": "init_lora_weights",
+    }
+    return {
+        "r": 8,
+        "lora_alpha": 16,
+        **{aliases.get(k, k): v for k, v in lora_config.items()},
+    }
 
-    Yields tuples of (result, warmup_done) where warmup_done indicates if warmup just finished.
-    """
-    precalculate_logprobs = _config.get("precalculate_logprobs", False)
 
-    for offset in range(0, packed_tensors["tokens"].shape[0]):
-        for _ in range(2 if warmup else 1):
-            if precalculate_logprobs and not warmup:
-                # Preserve original logprobs before overwriting
-                packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore
-                packed_tensors["logprobs"] = precalculate_new_logprobs(
-                    trainer, peft_model, packed_tensors, config, _config
-                )
-                precalculate_logprobs = False
-
-            inputs_queue.put_nowait(
-                create_train_inputs(packed_tensors, offset, config, _config, warmup)
-            )
-
-            # Wait for a result from the queue or for the training task to,
-            # presumably, raise an exception
-            done, _ = await asyncio.wait(
-                [
-                    asyncio.create_task(results_queue.get()),
-                    train_task,
-                ],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if verbose:
-                print(
-                    "Done waiting for a result from the queue or for the training task to, presumably, raise an exception"
-                )
-            for task in done:
-                result = task.result()
-                # If `result` is `None`, the training task finished somehow.
-                assert result is not None, "The training task should never finish."
-                results_queue.task_done()
-                if warmup:
-                    gc_and_empty_cuda_cache()
-                    await asyncio.sleep(0.1)
-                    warmup = False
-                else:
-                    yield result
+class _RuntimeRequestKwargs(TypedDict, total=False):
+    headers: dict[str, str]
 
 
 def save_checkpoint(
@@ -142,111 +75,58 @@ def save_checkpoint(
     verbose: bool = False,
 ) -> str:
     """Save a checkpoint and return the checkpoint directory path."""
+    # _use_adapter() may load reference adapters for KL/logprob computation and
+    # keep them attached to the PEFT model. Before saving, keep only active
+    # adapter(s) and drop the rest to release GPU/CPU memory.
+    try:
+        peft_model = trainer.accelerator.unwrap_model(  # type: ignore[attr-defined]
+            trainer.model, keep_fp32_wrapper=False
+        )
+        active_adapters = peft_model.active_adapter
+        if isinstance(active_adapters, str):
+            keep_adapters = {active_adapters}
+        else:
+            keep_adapters = set(active_adapters)
+
+        before_adapters = list(peft_model.peft_config.keys())
+        print(f"Adapters before cleanup: {before_adapters}")
+        print(f"Keeping active adapter(s): {sorted(keep_adapters)}")
+
+        for adapter_name in before_adapters:
+            if adapter_name not in keep_adapters:
+                peft_model.delete_adapter(adapter_name)
+                print(f"Deleted unused adapter: {adapter_name}")
+
+        after_adapters = list(peft_model.peft_config.keys())
+        print(f"Adapters after cleanup: {after_adapters}")
+    except Exception as e:
+        print(f"Warning: failed to cleanup unused adapters: {e}")
+
     if verbose:
         print("Saving new LoRA adapter...")
     next_step = get_step_from_dir(output_dir) + 1
     checkpoint_dir = get_step_checkpoint_dir(output_dir, next_step)
     os.makedirs(checkpoint_dir, exist_ok=True)
     trainer.save_model(checkpoint_dir)
+    convert_checkpoint_if_needed(checkpoint_dir)
+
+    gc_and_empty_cuda_cache()
     return checkpoint_dir
 
 
-# ============================================================================
-# Model Classes
-# ============================================================================
+def _find_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
-class CausalLM(PreTrainedModel, GenerationMixin):
-    """Dummy class for type checking."""
-
-    pass
-
-
-@dataclass
-class UnslothState:
-    model: CausalLM
-    tokenizer: PreTrainedTokenizerBase
-    peft_model: peft.peft_model.PeftModelForCausalLM
-    trainer: GRPOTrainer
-    inputs_queue: asyncio.Queue[TrainInputs]
-    results_queue: asyncio.Queue[dict[str, float]]
-    _is_offloaded: bool = False
-    _pinned_buffers: dict[str, torch.Tensor] | None = None
-
-    def offload_to_cpu(self) -> None:
-        """Offload training model and optimizer to CPU using pinned memory for faster transfers."""
-        if self._is_offloaded:
-            return
-
-        # Initialize pinned buffer storage
-        if self._pinned_buffers is None:
-            self._pinned_buffers = {}
-
-        # Offload model parameters to pinned memory for faster reload
-        for name, param in self.peft_model.named_parameters():
-            if param.device.type == "cuda":
-                # Create pinned buffer if not exists or wrong size
-                if (
-                    name not in self._pinned_buffers
-                    or self._pinned_buffers[name].shape != param.shape
-                ):
-                    self._pinned_buffers[name] = torch.empty(
-                        param.shape, dtype=param.dtype, device="cpu", pin_memory=True
-                    )
-                # Async copy to pinned memory
-                self._pinned_buffers[name].copy_(param.data, non_blocking=True)
-                param.data = self._pinned_buffers[name]
-
-        # Offload optimizer state to pinned memory
-        optimizer = getattr(self.trainer, "optimizer", None)
-        if optimizer is not None and hasattr(optimizer, "state"):
-            for param_id, state in optimizer.state.items():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor) and v.device.type == "cuda":
-                        key = f"opt_{id(param_id)}_{k}"
-                        if (
-                            key not in self._pinned_buffers
-                            or self._pinned_buffers[key].shape != v.shape
-                        ):
-                            self._pinned_buffers[key] = torch.empty(
-                                v.shape, dtype=v.dtype, device="cpu", pin_memory=True
-                            )
-                        self._pinned_buffers[key].copy_(v, non_blocking=True)
-                        state[k] = self._pinned_buffers[key]
-
-        # Sync to ensure all copies are complete before freeing GPU memory
-        torch.cuda.synchronize()
-
-        self._is_offloaded = True
-        gc_and_empty_cuda_cache()
-
-    def reload_to_gpu(self, device: str = "cuda:0") -> None:
-        """Reload training model and optimizer back to GPU using async transfers."""
-        if not self._is_offloaded:
-            return
-
-        # Reload model parameters from pinned memory (fast async transfer)
-        for name, param in self.peft_model.named_parameters():
-            if param.device.type == "cpu":
-                # Allocate on GPU and async copy from pinned memory
-                gpu_tensor = torch.empty(param.shape, dtype=param.dtype, device=device)
-                gpu_tensor.copy_(param.data, non_blocking=True)
-                param.data = gpu_tensor
-
-        # Reload optimizer state
-        optimizer = getattr(self.trainer, "optimizer", None)
-        if optimizer is not None and hasattr(optimizer, "state"):
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor) and v.device.type == "cpu":
-                        gpu_tensor = torch.empty(v.shape, dtype=v.dtype, device=device)
-                        gpu_tensor.copy_(v, non_blocking=True)
-                        state[k] = gpu_tensor
-
-        # Sync to ensure all copies are complete before training
-        torch.cuda.synchronize()
-
-        self._is_offloaded = False
+def _normalize_merged_checkpoint_name(name: str) -> str:
+    # PEFT wraps adapted modules under `.base_layer`, but vLLM expects the
+    # original checkpoint parameter names during update_weights().
+    normalized = name.removeprefix("base_model.model.")
+    while ".base_layer." in normalized:
+        normalized = normalized.replace(".base_layer.", ".")
+    return normalized
 
 
 # ============================================================================
@@ -262,68 +142,688 @@ class UnslothService:
     output_dir: str
     _is_sleeping: bool = False
     _latest_step: int = 0
-    _lora_id_counter: int = 1  # Start from 1 since 0 is reserved
+    _vllm_runtime: ManagedVllmRuntime = field(
+        default_factory=ManagedVllmRuntime,
+        init=False,
+        repr=False,
+    )
+    _weight_transfer_group: Any = field(default=None, init=False, repr=False)
+    _lifecycle: ServiceLifecycle = field(
+        default_factory=ServiceLifecycle,
+        init=False,
+        repr=False,
+    )
+    _child_processes: ChildProcessSupervisor = field(init=False, repr=False)
+    _loaded_adapter_steps: set[int] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _loaded_exact_adapter_steps: set[int] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _exact_adapter_refcounts: dict[int, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _exact_adapter_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    _serving_capabilities: ServingCapabilities | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
-    def _next_lora_id(self) -> int:
-        """Return a new unique LoRA ID to avoid collisions in vLLM."""
-        self._lora_id_counter += 1
-        return self._lora_id_counter
+    def __post_init__(self) -> None:
+        self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
+
+    def _on_child_process_exit(self, error: RuntimeError) -> None:
+        logger.error("%s", error)
+        self.close()
+
+    def _raise_if_child_failed(self) -> None:
+        self._child_processes.raise_if_failed()
+
+    @property
+    def is_dedicated(self) -> bool:
+        return is_dedicated_mode(self.config)
+
+    @property
+    def rollout_weights_mode(self) -> Literal["lora", "merged"]:
+        mode = self.config["rollout_weights_mode"]
+        assert mode in {"lora", "merged"}
+        return mode
+
+    @property
+    def rollout_weight_update_mode(self) -> Literal["step_lora", "in_flight_lora"]:
+        mode = self.config.get("rollout_weight_update_mode", "step_lora")
+        assert mode in {"step_lora", "in_flight_lora"}
+        return mode
+
+    @property
+    def _in_flight_lora_slot(self) -> str:
+        return in_flight_lora_name(self.model_name)
+
+    @property
+    def _initial_served_model_name(self) -> str:
+        if (
+            self.rollout_weights_mode == "lora"
+            and self.rollout_weight_update_mode == "in_flight_lora"
+        ):
+            return self._in_flight_lora_slot
+        return f"{self.model_name}@{self._latest_step}"
+
+    def _exact_lora_name(self, step: int) -> str:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            return f"{self.model_name}:eval@{step}"
+        return f"{self.model_name}@{step}"
+
+    @property
+    def _vllm_base_url(self) -> str:
+        return self._vllm_runtime.base_url
+
+    @property
+    def _vllm_host(self) -> str:
+        return self._vllm_runtime.host
+
+    @property
+    def _vllm_port(self) -> int:
+        return self._vllm_runtime.port
+
+    @_vllm_port.setter
+    def _vllm_port(self, port: int) -> None:
+        self._vllm_runtime.port = port
+
+    @property
+    def _vllm_api_key(self) -> str | None:
+        return self._vllm_runtime.api_key
+
+    @property
+    def _vllm_nccl_so_path(self) -> str | None:
+        return self._vllm_runtime.nccl_so_path
+
+    def _runtime_cuda_visible_devices(self) -> str:
+        if self.is_dedicated:
+            return ",".join(str(gpu_id) for gpu_id in self.config["inference_gpu_ids"])
+        if visible := os.environ.get("CUDA_VISIBLE_DEVICES"):
+            return visible
+        return ",".join(str(index) for index in range(torch.cuda.device_count()))
+
+    def _runtime_engine_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
+        engine_args = dict(self.config.get("engine_args", {}))
+        if config and "engine_args" in config:
+            engine_args.update(dict(config["engine_args"]))
+        engine_args.setdefault("generation_config", "vllm")
+        if self.rollout_weights_mode == "merged":
+            engine_args["weight_transfer_config"] = {"backend": "nccl"}
+            engine_args.pop("enable_lora", None)
+            engine_args.pop("max_loras", None)
+        else:
+            engine_args["enable_lora"] = True
+            engine_args.setdefault("max_loras", 2)
+        for key in ("model", "served_model_name"):
+            engine_args.pop(key, None)
+        return engine_args
+
+    def _runtime_server_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
+        server_args: dict[str, object] = {
+            "return_tokens_as_token_ids": True,
+            "enable_auto_tool_choice": True,
+            "tool_call_parser": "hermes",
+        }
+        if config and "server_args" in config:
+            server_args.update(dict(config["server_args"]))
+        for key in ("port", "host", "lora_modules"):
+            server_args.pop(key, None)
+        return server_args
+
+    def _runtime_headers(self) -> dict[str, str]:
+        if self._vllm_api_key is None:
+            return {}
+        return {"Authorization": f"Bearer {self._vllm_api_key}"}
+
+    def _runtime_request_kwargs(self) -> _RuntimeRequestKwargs:
+        headers = self._runtime_headers()
+        return {"headers": headers} if headers else {}
+
+    @property
+    def serving_capabilities(self) -> ServingCapabilities:
+        if self._serving_capabilities is None:
+            raise RuntimeError("vLLM serving capabilities have not been discovered")
+        return self._serving_capabilities
+
+    async def get_serving_capabilities(self) -> ServingCapabilities:
+        return self.serving_capabilities
+
+    def _sleep_mode_enabled(self) -> bool:
+        return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
+
+    async def aclose(self) -> None:
+        state = self.__dict__.get("_state")
+        if isinstance(state, UnslothTrainContext):
+            await state.stop_background_training()
+        self.close()
+
+    # =========================================================================
+    # Dedicated mode: vLLM subprocess lifecycle
+    # =========================================================================
+
+    async def _start_vllm_subprocess(
+        self,
+        lora_path: str,
+        port: int,
+        config: dev.OpenAIServerConfig | None = None,
+    ) -> tuple[str, int]:
+        self._raise_if_child_failed()
+        server_args = self._runtime_server_args(config)
+        location = await self._vllm_runtime.start(
+            launch_config=VllmRuntimeLaunchConfig(
+                base_model=self.base_model,
+                port=port,
+                host=self._vllm_runtime.host,
+                cuda_visible_devices=self._runtime_cuda_visible_devices(),
+                lora_path=lora_path,
+                served_model_name=self._initial_served_model_name,
+                rollout_weights_mode=self.rollout_weights_mode,
+                engine_args=self._runtime_engine_args(config),
+                server_args=server_args,
+            ),
+            output_dir=self.output_dir,
+            child_processes=self._child_processes,
+            install_parent_cleanup=lambda: self._lifecycle.install_parent_cleanup(
+                self.close
+            ),
+            cleanup_on_error=self.close,
+        )
+        logger.info(
+            "vLLM runtime ready on port %d (GPUs: %s)",
+            port,
+            self._runtime_cuda_visible_devices(),
+        )
+        return location
+
+    async def _set_served_model_name(self, step: int) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        served_model_name = f"{self.model_name}@{step}"
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/art/set_served_model_name",
+                json={"name": served_model_name},
+                **self._runtime_request_kwargs(),
+                timeout=30.0,
+            )
+            response.raise_for_status()
+        logger.info(
+            "[DEDICATED] Updated merged rollout alias to %s",
+            served_model_name,
+        )
+
+    async def _init_merged_weight_transfer(self) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        if self._weight_transfer_group is not None:
+            return
+
+        async with httpx.AsyncClient() as client:
+            world_size_response = await client.get(
+                f"{self._vllm_base_url}/get_world_size",
+                **self._runtime_request_kwargs(),
+                timeout=30.0,
+            )
+            try:
+                world_size_response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(
+                    "Merged rollout weights require a vLLM build with the "
+                    "/get_world_size endpoint"
+                ) from exc
+            inference_world_size = int(world_size_response.json()["world_size"])
+            if self._vllm_nccl_so_path is None:
+                raise RuntimeError("vLLM runtime NCCL path is not initialized")
+
+            master_port = _find_free_tcp_port()
+            init_info = {
+                "master_address": "127.0.0.1",
+                "master_port": master_port,
+                "rank_offset": 1,
+                "world_size": inference_world_size + 1,
+            }
+
+            remote_init_task = asyncio.create_task(
+                client.post(
+                    f"{self._vllm_base_url}/init_weight_transfer_engine",
+                    json={"init_info": init_info},
+                    **self._runtime_request_kwargs(),
+                    timeout=300.0,
+                )
+            )
+            self._weight_transfer_group = await asyncio.to_thread(
+                trainer_init,
+                {
+                    "master_address": init_info["master_address"],
+                    "master_port": init_info["master_port"],
+                    "world_size": init_info["world_size"],
+                    "nccl_so_path": self._vllm_nccl_so_path,
+                },
+            )
+            remote_init_response = await remote_init_task
+            try:
+                remote_init_response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(
+                    "Merged rollout weights require a vLLM build with the "
+                    "/init_weight_transfer_engine endpoint"
+                ) from exc
+
+        logger.info(
+            "[DEDICATED] Initialized merged weight transfer: inference_world_size=%d",
+            inference_world_size,
+        )
+
+    def _merged_checkpoint_weights_for_vllm(self) -> list[tuple[str, torch.Tensor]]:
+        model = self._state.peft_model.base_model.model
+        device = next(model.parameters()).device
+        assert device.type == "cuda"
+
+        weights: list[tuple[str, torch.Tensor]] = []
+        normalized_names: set[str] = set()
+        for name, tensor in model.state_dict().items():
+            if "lora_" in name:
+                continue
+            normalized_name = _normalize_merged_checkpoint_name(name)
+            assert normalized_name not in normalized_names
+            normalized_names.add(normalized_name)
+            detached = tensor.detach()
+            if detached.device != device:
+                detached = detached.to(device=device, non_blocking=True)
+            weights.append((normalized_name, detached))
+
+        assert weights
+        return weights
+
+    async def _sync_merged_weights(
+        self,
+        step: int,
+        pause_generation: bool,
+    ) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        assert self._weight_transfer_group is not None
+
+        peft_model = self._state.peft_model
+        merged = False
+        error: Exception | None = None
+        logger.info("[DEDICATED] Syncing merged rollout weights for step %d", step)
+
+        async with httpx.AsyncClient() as client:
+            try:
+                if pause_generation:
+                    response = await client.post(
+                        f"{self._vllm_base_url}/pause",
+                        params={"mode": "wait"},
+                        **self._runtime_request_kwargs(),
+                        timeout=300.0,
+                    )
+                    response.raise_for_status()
+
+                peft_model.merge_adapter()
+                merged = True
+                torch.cuda.synchronize()
+
+                weights = self._merged_checkpoint_weights_for_vllm()
+                response = await client.post(
+                    f"{self._vllm_base_url}/start_weight_update",
+                    json={"is_checkpoint_format": True},
+                    **self._runtime_request_kwargs(),
+                    timeout=300.0,
+                )
+                response.raise_for_status()
+                update_info = {
+                    "names": [name for name, _ in weights],
+                    "dtype_names": [
+                        str(tensor.dtype).removeprefix("torch.")
+                        for _, tensor in weights
+                    ],
+                    "shapes": [list(tensor.shape) for _, tensor in weights],
+                    "packed": True,
+                    "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+                    "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
+                }
+
+                _, update_response = await asyncio.gather(
+                    asyncio.to_thread(
+                        trainer_send_weights,
+                        iter(weights),
+                        {
+                            "group": self._weight_transfer_group,
+                            "packed": True,
+                            "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+                            "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
+                        },
+                    ),
+                    client.post(
+                        f"{self._vllm_base_url}/update_weights",
+                        json={"update_info": update_info},
+                        **self._runtime_request_kwargs(),
+                        timeout=600.0,
+                    ),
+                )
+                try:
+                    update_response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise RuntimeError(
+                        "Merged rollout weights require a vLLM build with the "
+                        "/update_weights endpoint"
+                    ) from exc
+                response = await client.post(
+                    f"{self._vllm_base_url}/finish_weight_update",
+                    **self._runtime_request_kwargs(),
+                    timeout=600.0,
+                )
+                response.raise_for_status()
+                self._latest_step = step
+                await self._set_served_model_name(step)
+            except Exception as exc:
+                error = exc
+                raise
+            finally:
+                if merged:
+                    peft_model.unmerge_adapter()
+                    torch.cuda.synchronize()
+                if pause_generation:
+                    try:
+                        response = await client.post(
+                            f"{self._vllm_base_url}/resume",
+                            **self._runtime_request_kwargs(),
+                            timeout=30.0,
+                        )
+                        response.raise_for_status()
+                    except Exception:
+                        if error is None:
+                            raise
+                        logger.exception(
+                            "Failed to resume generation after merged weight sync error"
+                        )
+
+        logger.info(
+            "[DEDICATED] Merged rollout sync complete for step %d",
+            step,
+        )
+
+    async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
+        """Reload LoRA adapter in vLLM subprocess via HTTP."""
+        import httpx
+
+        self._raise_if_child_failed()
+        lora_name = f"{self.model_name}@{step}"
+        logger.info(
+            f"[DEDICATED] _reload_adapter START: lora_name={lora_name} "
+            f"path={checkpoint_path}"
+        )
+        payload: dict[str, Any] = {
+            "lora_name": lora_name,
+            "lora_path": checkpoint_path,
+        }
+        if self.serving_capabilities.inplace_lora_load:
+            payload["load_inplace"] = True
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/v1/load_lora_adapter",
+                json=payload,
+                **self._runtime_request_kwargs(),
+                timeout=60.0,
+            )
+            response.raise_for_status()
+        logger.info(
+            f"[DEDICATED] _reload_adapter DONE: lora_name={lora_name} "
+            f"status={response.status_code}"
+        )
+        self._latest_step = step
+        self._loaded_adapter_steps.add(step)
+
+    async def _update_in_flight_adapter(self, checkpoint_path: str, step: int) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        self.serving_capabilities.require(
+            "in_flight_lora_updates", operation="In-flight LoRA updates"
+        )
+        self.serving_capabilities.require(
+            "policy_token_spans", operation="In-flight LoRA updates"
+        )
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/art/in_flight_lora_update",
+                json={
+                    "model_name": self._in_flight_lora_slot,
+                    "lora_slot": self._in_flight_lora_slot,
+                    "lora_path": checkpoint_path,
+                    "policy_version": step,
+                },
+                **self._runtime_request_kwargs(),
+                timeout=60.0,
+            )
+            response.raise_for_status()
+        self._latest_step = step
+        self._loaded_adapter_steps.add(step)
+
+    async def _load_rollout_lora_for_step(
+        self, checkpoint_path: str, step: int
+    ) -> None:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            await self._update_in_flight_adapter(checkpoint_path, step)
+        else:
+            await self._reload_adapter(checkpoint_path, step)
+
+    async def acquire_exact_adapter(self, step: int, checkpoint_path: str) -> str:
+        if self.rollout_weights_mode != "lora":
+            raise RuntimeError("Exact checkpoint eval requires LoRA rollout serving")
+        lora_name = self._exact_lora_name(step)
+        async with self._exact_adapter_lock:
+            loaded_steps = (
+                self._loaded_exact_adapter_steps
+                if self.rollout_weight_update_mode == "in_flight_lora"
+                else self._loaded_adapter_steps
+            )
+            if step in loaded_steps:
+                if self.rollout_weight_update_mode == "in_flight_lora":
+                    self._exact_adapter_refcounts[step] += 1
+                return lora_name
+            import httpx
+
+            self._raise_if_child_failed()
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self._vllm_base_url}/v1/load_lora_adapter",
+                    json={
+                        "lora_name": lora_name,
+                        "lora_path": checkpoint_path,
+                    },
+                    **self._runtime_request_kwargs(),
+                    timeout=60.0,
+                )
+                response.raise_for_status()
+            loaded_steps.add(step)
+            if self.rollout_weight_update_mode == "in_flight_lora":
+                self._exact_adapter_refcounts[step] = 1
+        return lora_name
+
+    async def release_exact_adapter(self, step: int) -> None:
+        if self.rollout_weight_update_mode != "in_flight_lora":
+            return
+        async with self._exact_adapter_lock:
+            count = self._exact_adapter_refcounts[step]
+            if count > 1:
+                self._exact_adapter_refcounts[step] = count - 1
+                return
+            await self._unload_exact_adapter(step)
+            del self._exact_adapter_refcounts[step]
+
+    async def _unload_adapter_name(self, lora_name: str) -> bool:
+        import httpx
+
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/v1/unload_lora_adapter",
+                json={"lora_name": lora_name},
+                **self._runtime_request_kwargs(),
+                timeout=30.0,
+            )
+            if response.status_code == 404:
+                return False
+            response.raise_for_status()
+        return True
+
+    async def _unload_adapter(self, step: int) -> None:
+        await self._unload_adapter_name(f"{self.model_name}@{step}")
+        self._loaded_adapter_steps.discard(step)
+
+    async def _unload_exact_adapter(self, step: int) -> None:
+        await self._unload_adapter_name(self._exact_lora_name(step))
+        self._loaded_exact_adapter_steps.discard(step)
+
+    async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
+        if self.rollout_weights_mode != "lora" or self._vllm_port == 0:
+            return
+        async with self._exact_adapter_lock:
+            for step in sorted(self._loaded_exact_adapter_steps - retain_steps):
+                if self._exact_adapter_refcounts.get(step, 0) == 0:
+                    await self._unload_exact_adapter(step)
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            return
+        for step in sorted(self._loaded_adapter_steps - retain_steps):
+            if step == self._latest_step:
+                continue
+            await self._unload_adapter(step)
+
+    def close(self) -> None:
+        """Terminate vLLM subprocess if running."""
+        if not self._lifecycle.begin_close():
+            return
+        weight_transfer_group = self._weight_transfer_group
+        self._weight_transfer_group = None
+        try:
+            try:
+                if weight_transfer_group is not None:
+                    close = getattr(weight_transfer_group, "close", None)
+                    if close is not None:
+                        close()
+            finally:
+                self._child_processes.close()
+                self._vllm_runtime.close()
+                self._loaded_adapter_steps.clear()
+                self._loaded_exact_adapter_steps.clear()
+                self._exact_adapter_refcounts.clear()
+        finally:
+            self._lifecycle.restore_parent_cleanup()
+
+    # =========================================================================
+    # start_openai_server
+    # =========================================================================
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
     ) -> tuple[str, int]:
+        self._raise_if_child_failed()
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
-            # Create initial LoRA checkpoint if none exists
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
             os.makedirs(os.path.dirname(lora_path), exist_ok=True)
             self._state.trainer.save_model(lora_path)
+            convert_checkpoint_if_needed(lora_path)
             self._latest_step = 0
         else:
-            # Extract step from checkpoint path
             self._latest_step = get_step_from_dir(self.output_dir)
 
-        # Offload training model to CPU before vLLM starts to free GPU memory
-        self._state.offload_to_cpu()
+        if not self.is_dedicated:
+            if not self._sleep_mode_enabled():
+                raise ValueError(
+                    "Shared-GPU mode requires engine_args.enable_sleep_mode=True "
+                    "for the external vLLM runtime"
+                )
+            self._state.offload_to_cpu()
 
-        server_config = dev.get_openai_server_config(
-            model_name=self.model_name,
-            base_model=self.base_model,
-            log_file=f"{self.output_dir}/logs/vllm.log",
-            lora_path=lora_path,
+        port = (config or {}).get("server_args", {}).get("port", 8000)
+        vllm_location = await self._start_vllm_subprocess(
+            lora_path,
+            port,
             config=config,
         )
-        await openai_server_task(
-            engine=await self.llm,
-            config=server_config,
-        )
-        return server_config.get("server_args", {}).get(
-            "host"
-        ) or "0.0.0.0", server_config.get("server_args", {}).get("port", 8000)
+        try:
+            self._serving_capabilities = await discover_serving_capabilities(
+                base_url=self._vllm_base_url,
+                headers=self._runtime_headers(),
+                allow_openai_compatible=False,
+            )
+            if self.rollout_weights_mode == "lora":
+                if self.rollout_weight_update_mode == "in_flight_lora":
+                    await self._update_in_flight_adapter(lora_path, self._latest_step)
+                else:
+                    self._loaded_adapter_steps.add(self._latest_step)
+            if self.rollout_weights_mode == "merged":
+                _ = self._state
+                await self._init_merged_weight_transfer()
+                await self._sync_merged_weights(self._latest_step, False)
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="vLLM startup and Unsloth cleanup failed.",
+            )
+            raise
+        return vllm_location
 
     async def vllm_engine_is_sleeping(self) -> bool:
         return self._is_sleeping
 
-    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
-        """Register a LoRA adapter for a specific checkpoint step.
+    async def _sleep_runtime(self) -> None:
+        import httpx
 
-        This is called when training is skipped but the checkpoint is renamed.
-        """
-        llm = await self.llm
-        await llm.pause_generation()
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/sleep",
+                params={"level": 1, "mode": "wait"},
+                **self._runtime_request_kwargs(),
+                timeout=300.0,
             )
-        )
-        if not added:
-            raise RuntimeError(
-                f"Failed to add LoRA adapter for step {step} at {checkpoint_dir}"
+            response.raise_for_status()
+        self._is_sleeping = True
+
+    async def _wake_runtime(self) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/wake_up",
+                **self._runtime_request_kwargs(),
+                timeout=300.0,
             )
+            response.raise_for_status()
+        self._is_sleeping = False
+
+    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
+        if self.rollout_weights_mode == "merged":
+            await self._set_served_model_name(step)
+        else:
+            await self._load_rollout_lora_for_step(checkpoint_dir, step)
         self._latest_step = step
-        await llm.resume_generation()
 
     async def train(
         self,
@@ -332,297 +832,188 @@ class UnslothService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        llm = await self.llm
+        try:
+            self._raise_if_child_failed()
+            if self.is_dedicated:
+                async for result in self._train_dedicated(
+                    disk_packed_tensors, config, _config, verbose
+                ):
+                    yield result
+                return
 
-        # Pause generation to prevent new requests during training
-        await llm.pause_generation()
-
-        # Determine sleep level based on outstanding requests:
-        # - level 1: offload KV cache to CPU (can resume with existing KV state)
-        # - level 2: discard KV cache (fresh start after wake)
-        has_unfinished = llm.output_processor.has_unfinished_requests()
-        if has_unfinished:
-            sleep_level = 1
-        else:
-            # Reset prefix cache before discarding KV cache
-            await llm.reset_prefix_cache()
-            sleep_level = 2
-
-        # Put workers to sleep
-        await run_on_workers(llm, do_sleep, level=sleep_level)
-        self._is_sleeping = True
-        gc_and_empty_cuda_cache()
-
-        # Reload training model to GPU (after vLLM is asleep)
-        self._state.reload_to_gpu()
-
-        # Load packed tensors
-        packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
-
-        # Wait for existing batches to finish
-        await self._state.results_queue.join()
-
-        # If we haven't already, start the training task
-        if not hasattr(self, "_train_task") or self._train_task is None:
-            self._train_task = asyncio.create_task(
-                train(
-                    trainer=self._state.trainer,
-                    results_queue=self._state.results_queue,
-                )
+            async for result in self._train_shared(
+                disk_packed_tensors, config, _config, verbose
+            ):
+                yield result
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="Unsloth training and cleanup failed.",
             )
-            warmup = True
-        else:
-            warmup = False
+            raise
 
-        # Train on the batch using shared logic
-        async for result in process_train_batch(
-            packed_tensors=packed_tensors,
+    async def _train_dedicated(
+        self,
+        disk_packed_tensors: DiskPackedTensors,
+        config: types.TrainConfig,
+        _config: dev.TrainConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train in dedicated mode — no sleep/wake, vLLM keeps running on separate GPU."""
+        async for result in run_unsloth_rl_training(
+            self._state,
+            disk_packed_tensors=disk_packed_tensors,
             config=config,
             _config=_config,
-            inputs_queue=self._state.inputs_queue,
-            results_queue=self._state.results_queue,
-            train_task=self._train_task,
-            trainer=self._state.trainer,
-            peft_model=self._state.peft_model,
-            warmup=warmup,
             verbose=verbose,
         ):
             yield result
 
-        # Save checkpoint after training
         checkpoint_dir = save_checkpoint(
             trainer=self._state.trainer,
             output_dir=self.output_dir,
             verbose=verbose,
         )
 
-        # Offload training model to CPU before waking vLLM
-        self._state.offload_to_cpu()
-
-        # Free memory before waking up vLLM
-        gc_and_empty_cuda_cache()
-        await asyncio.sleep(
-            0.5
-        )  # Longer delay to allow memory cleanup and pending ops to complete
-
-        # Wake up workers
-        await run_on_workers(llm, do_wake_up)
-        self._is_sleeping = False
-
-        # Determine the new step from the checkpoint directory
-        # checkpoint_dir format is: {output_dir}/checkpoints/{step:04d}
         new_step = int(os.path.basename(checkpoint_dir))
-
-        # Add the new LoRA adapter
-        # We keep old LoRAs loaded - vLLM will page them out as needed
-        added = await llm.add_lora(
-            LoRARequest(
-                lora_name=f"{self.model_name}@{new_step}",
-                lora_int_id=self._next_lora_id(),
-                lora_path=checkpoint_dir,
+        if self.rollout_weights_mode == "merged":
+            logger.info(
+                "[DEDICATED] _train_dedicated: saved checkpoint step=%s, syncing merged weights...",
+                new_step,
             )
-        )
-        if not added:
-            raise RuntimeError(
-                f"Failed to add LoRA adapter for step {new_step} at {checkpoint_dir}"
+            await self._sync_merged_weights(new_step, True)
+        else:
+            logger.info(
+                "[DEDICATED] _train_dedicated: saved checkpoint step=%s, reloading adapter...",
+                new_step,
             )
+            await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
         self._latest_step = new_step
+        logger.info(
+            f"[DEDICATED] _train_dedicated: inference weights updated for step {new_step}"
+        )
 
-        # Resume generation after LoRA add is complete
-        await llm.resume_generation()
+    async def _train_shared(
+        self,
+        disk_packed_tensors: DiskPackedTensors,
+        config: types.TrainConfig,
+        _config: dev.TrainConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        await self._sleep_runtime()
+        gc_and_empty_cuda_cache()
+        self._state.reload_to_gpu()
+
+        async for result in run_unsloth_rl_training(
+            self._state,
+            disk_packed_tensors=disk_packed_tensors,
+            config=config,
+            _config=_config,
+            verbose=verbose,
+        ):
+            yield result
+
+        checkpoint_dir = save_checkpoint(
+            trainer=self._state.trainer,
+            output_dir=self.output_dir,
+            verbose=verbose,
+        )
+
+        self._state.offload_to_cpu()
+        gc_and_empty_cuda_cache()
+        await asyncio.sleep(0.5)
+        await self._wake_runtime()
+
+        new_step = int(os.path.basename(checkpoint_dir))
+        await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
+        self._latest_step = new_step
 
         if verbose:
             print("UnslothService.train complete")
 
-    @cached_property
-    def _state(self) -> UnslothState:
-        import unsloth
+    # =========================================================================
+    # SFT training
+    # =========================================================================
 
-        # Initialize Unsloth model
-        init_args = self.config.get("init_args", {})
+    async def train_sft(
+        self,
+        batches: list[SFTBatch],
+        config: types.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train using SFT on pre-computed batches.
+
+        Args:
+            batches: List of SFTBatch objects to train on.
+            config: SFT batch/grad-accumulation configuration.
+            verbose: Whether to print detailed logs.
+
+        Yields:
+            Dictionary containing training metrics for each batch.
+        """
+        try:
+            self._raise_if_child_failed()
+            if self.is_dedicated:
+                raise NotImplementedError(
+                    "train_sft is not yet supported in dedicated mode"
+                )
+
+            await self._sleep_runtime()
+            gc_and_empty_cuda_cache()
+            self._state.reload_to_gpu()
+            if verbose:
+                print("SFT training started")
+
+            async for result in run_unsloth_sft_training(
+                self._state,
+                batches,
+                verbose=verbose,
+                max_grad_norm=1.0,
+            ):
+                yield {
+                    "loss/train": result["loss"],
+                    "loss/learning_rate": result["learning_rate"],
+                    "loss/grad_norm": result["grad_norm"],
+                }
+
+            checkpoint_dir = save_checkpoint(
+                trainer=self._state.trainer,
+                output_dir=self.output_dir,
+                verbose=verbose,
+            )
+
+            self._state.offload_to_cpu()
+            gc_and_empty_cuda_cache()
+            await asyncio.sleep(0.5)
+            await self._wake_runtime()
+            new_step = int(os.path.basename(checkpoint_dir))
+            await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
+            self._latest_step = new_step
+
+            if verbose:
+                print("SFT training finished")
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="Unsloth SFT training and cleanup failed.",
+            )
+            raise
+
+    @cached_property
+    def _state(self) -> UnslothTrainContext:
+        init_args = dict(self.config.get("init_args", {}))
         checkpoint_dir = get_last_checkpoint_dir(self.output_dir)
-        if checkpoint_dir:
-            init_args["model_name"] = checkpoint_dir
-        else:
-            init_args["model_name"] = self.base_model
-
-        model, tokenizer = cast(
-            tuple[CausalLM, PreTrainedTokenizerBase],
-            unsloth.FastLanguageModel.from_pretrained(**init_args),
+        init_args["model_name"] = checkpoint_dir or self.base_model
+        return create_unsloth_train_context(
+            init_args=init_args,
+            peft_args=_peft_args_from_lora_config(
+                cast(dev.BackendModelConfig, self.config).get("lora_config", {})
+            ),
+            trainer_args=cast(dict[str, Any], self.config.get("trainer_args", {})),
         )
-
-        # Initialize PEFT model - skip if already a PeftModel (e.g. loaded from checkpoint)
-        if (
-            hasattr(model, "peft_config")
-            and getattr(model, "peft_config", None) is not None
-        ):
-            # Model already has LoRA adapters (loaded from checkpoint)
-            peft_model = cast(peft.peft_model.PeftModelForCausalLM, model)
-        else:
-            peft_model = cast(
-                peft.peft_model.PeftModelForCausalLM,
-                unsloth.FastLanguageModel.get_peft_model(
-                    model, **self.config.get("peft_args", {})
-                ),
-            )
-
-        # Initialize trainer with dummy dataset
-        data = {"prompt": ""}
-        trainer = GRPOTrainer(
-            model=peft_model,  # type: ignore
-            reward_funcs=[],
-            args=GRPOConfig(**self.config.get("trainer_args", {})),
-            train_dataset=Dataset.from_list([data for _ in range(10_000_000)]),
-            processing_class=tokenizer,
-        )
-
-        # Initialize queues
-        inputs_queue: asyncio.Queue[TrainInputs] = asyncio.Queue()
-        results_queue: asyncio.Queue[dict[str, float]] = asyncio.Queue()
-
-        # Patch trainer _prepare_inputs() to pull from queue
-        def _async_prepare_inputs(*_: Any, **__: Any) -> dict[str, torch.Tensor]:
-            async def get_inputs() -> TrainInputs:
-                return await inputs_queue.get()
-
-            # Force otherwise synchronous _prepare_inputs() to yield
-            # with nested asyncio.run() call
-            inputs = asyncio.run(get_inputs())
-
-            return cast(dict[str, torch.Tensor], inputs)
-
-        trainer._prepare_inputs = _async_prepare_inputs
-
-        return UnslothState(
-            model=model,
-            tokenizer=tokenizer,
-            peft_model=peft_model,
-            trainer=trainer,
-            inputs_queue=inputs_queue,
-            results_queue=results_queue,
-        )
-
-    @cached_property
-    def llm(self) -> asyncio.Task[AsyncLLM]:
-        # Filter engine args to remove incompatible boolean flags
-        engine_args = {
-            **self.config.get("engine_args", {}),
-            "enable_lora": True,
-            "max_loras": self.config.get("engine_args", {}).get("max_loras", 2),
-        }
-        # Remove boolean flags that vLLM's argparse doesn't accept as =False
-        for key in ["enable_log_requests", "disable_log_requests"]:
-            engine_args.pop(key, None)
-        return asyncio.create_task(get_llm(AsyncEngineArgs(**engine_args)))  # ty:ignore[invalid-argument-type]
-
-
-# ============================================================================
-# Worker Sleep/Wake Functions
-# ============================================================================
-
-
-def do_sleep(*, level: int) -> None:
-    """
-    Put the worker to sleep, offloading both weights and KV cache.
-
-    Args:
-        level: The sleep level:
-            - 1: offload KV cache to CPU (can resume with existing KV state)
-            - 2: discard KV cache (fresh start after wake)
-    """
-    import ctypes
-    import gc
-
-    import torch
-    from vllm.device_allocator.cumem import (
-        CuMemAllocator,
-        libcudart,
-        unmap_and_release,
-    )
-
-    try:
-        from vllm.utils.platform_utils import is_pin_memory_available
-    except ImportError:
-        from vllm.utils import is_pin_memory_available
-
-    worker = get_worker()
-    allocator = CuMemAllocator.get_instance()
-
-    # Determine what to offload based on level:
-    # level=1: offload both weights and kv_cache to CPU
-    # level=2: offload weights, discard kv_cache
-    offload_to = "cpu" if level == 1 else "none"
-    tags_to_process = {"weights", "kv_cache"}
-
-    # Save buffers before level 2 sleep (like vLLM does)
-    if level == 2:
-        model = worker.model_runner.model
-        worker._sleep_saved_buffers = {
-            name: buffer.cpu().clone() for name, buffer in model.named_buffers()
-        }
-
-    for ptr, data in allocator.pointer_to_data.items():
-        if data.tag not in tags_to_process:
-            continue
-        handle = data.handle
-        size_in_bytes = handle[1]
-
-        # Always backup weights; backup kv_cache only at level 1
-        if offload_to != "none" or data.tag == "weights":
-            cpu_backup_tensor = torch.empty(
-                size_in_bytes,
-                dtype=torch.uint8,
-                device="cpu",
-                pin_memory=is_pin_memory_available(),
-            )
-            cpu_ptr = cpu_backup_tensor.data_ptr()
-            libcudart.cudaMemcpy(  # ty:ignore[possibly-missing-attribute]
-                ctypes.c_void_p(cpu_ptr), ctypes.c_void_p(ptr), size_in_bytes
-            )
-            data.cpu_backup_tensor = cpu_backup_tensor
-
-        unmap_and_release(handle)
-
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-def do_wake_up() -> None:
-    """
-    Wake up the worker from sleep, restoring offloaded weights and KV cache.
-    """
-    import ctypes
-
-    from vllm.device_allocator.cumem import (
-        CuMemAllocator,
-        create_and_map,
-        libcudart,
-    )
-
-    worker = get_worker()
-    allocator = CuMemAllocator.get_instance()
-
-    tags_to_process = {"weights", "kv_cache"}
-
-    for ptr, data in allocator.pointer_to_data.items():
-        if data.tag not in tags_to_process:
-            continue
-        create_and_map(data.handle)
-        if data.cpu_backup_tensor is not None:
-            cpu_backup_tensor = data.cpu_backup_tensor
-            size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
-            cpu_ptr = cpu_backup_tensor.data_ptr()
-            libcudart.cudaMemcpy(  # ty:ignore[possibly-missing-attribute]
-                ctypes.c_void_p(ptr),
-                ctypes.c_void_p(cpu_ptr),
-                size_in_bytes,
-            )
-            data.cpu_backup_tensor = None
-
-    # Restore buffers after level 2 sleep (like vLLM does)
-    if hasattr(worker, "_sleep_saved_buffers") and worker._sleep_saved_buffers:
-        model = worker.model_runner.model
-        for name, buffer in model.named_buffers():
-            if name in worker._sleep_saved_buffers:
-                buffer.copy_(worker._sleep_saved_buffers[name].to(buffer.device))
-        worker._sleep_saved_buffers = {}

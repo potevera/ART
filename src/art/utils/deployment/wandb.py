@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from art.errors import UnsupportedBaseModelDeploymentError
 
+from .. import wandb_sdk
 from .common import DeploymentConfig
 
 if TYPE_CHECKING:
@@ -21,7 +22,8 @@ class WandbDeploymentConfig(DeploymentConfig):
     - Qwen/Qwen2.5-14B-Instruct
     """
 
-    pass
+    provenance: list[str]
+    """The training provenance history for this model (e.g. ["local-rl", "serverless-rl"])."""
 
 
 WANDB_SUPPORTED_BASE_MODELS = [
@@ -36,6 +38,7 @@ def deploy_wandb(
     model: "TrainableModel",
     checkpoint_path: str,
     step: int,
+    config: "WandbDeploymentConfig | None" = None,
     verbose: bool = False,
 ) -> str:
     """Deploy a model to W&B by uploading a LoRA artifact.
@@ -44,13 +47,12 @@ def deploy_wandb(
         model: The TrainableModel to deploy.
         checkpoint_path: Local path to the checkpoint directory.
         step: The step number of the checkpoint.
+        config: Optional WandbDeploymentConfig with provenance metadata.
         verbose: Whether to print verbose output.
 
     Returns:
         The model name for inference: wandb-artifact:///{entity}/{project}/{name}:step{step}
     """
-    import wandb
-
     if model.base_model not in WANDB_SUPPORTED_BASE_MODELS:
         raise UnsupportedBaseModelDeploymentError(
             message=f"Base model {model.base_model} is not supported for serverless LoRA deployment by W&B. Supported models: {WANDB_SUPPORTED_BASE_MODELS}"
@@ -61,23 +63,26 @@ def deploy_wandb(
 
     # Get the user's default entity from W&B if not set
     if model.entity is None:
-        api = wandb.Api()
+        api = wandb_sdk.api()
         model.entity = api.default_entity
 
     if verbose:
         print(f"Uploading checkpoint from {checkpoint_path} to W&B...")
 
-    run = wandb.init(
-        name=model.name + " (deployment)",
+    run = wandb_sdk.init(
+        name=model.run_name + " (deployment)",
         entity=model.entity,
         project=model.project,
-        settings=wandb.Settings(api_key=os.environ["WANDB_API_KEY"]),
+        settings=wandb_sdk.settings(api_key=os.environ["WANDB_API_KEY"]),
     )
     try:
-        artifact = wandb.Artifact(
-            model.name,
+        metadata: dict[str, object] = {"wandb.base_model": model.base_model}
+        if config is not None:
+            metadata["wandb.provenance"] = config.provenance
+        artifact = wandb_sdk.artifact(
+            model.run_name,
             type="lora",
-            metadata={"wandb.base_model": model.base_model},
+            metadata=metadata,
             storage_region="coreweave-us",
         )
         artifact.add_dir(checkpoint_path)
@@ -94,7 +99,7 @@ def deploy_wandb(
         run.finish()
 
     inference_name = (
-        f"wandb-artifact:///{model.entity}/{model.project}/{model.name}:step{step}"
+        f"wandb-artifact:///{model.entity}/{model.project}/{model.run_name}:step{step}"
     )
     if verbose:
         print(f"Successfully deployed to W&B. Inference model name: {inference_name}")

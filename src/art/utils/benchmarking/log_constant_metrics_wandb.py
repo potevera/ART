@@ -1,14 +1,14 @@
 """Utilities for logging constant baseline metrics to Weights & Biases."""
 
-import wandb
-
 import art
+from art.utils import wandb_sdk
 
 
 async def log_constant_metrics_wandb(
     model: art.Model,
     num_steps: int,
     split_metrics: dict[str, dict[str, float]],
+    logged_run_name: str | None = None,
 ) -> None:
     """
     Log constant metrics to W&B as horizontal lines across all training steps.
@@ -29,9 +29,9 @@ async def log_constant_metrics_wandb(
 
         Example: `{"train": {"loss": 0.5}, "val": {"loss": 0.4, "accuracy": 0.8}}`
     """
-    run = wandb.init(
+    run = wandb_sdk.init(
         project=model.project,
-        name=model.name,
+        name=logged_run_name if logged_run_name else model._storage_name(),
         reinit="create_new",
     )
 

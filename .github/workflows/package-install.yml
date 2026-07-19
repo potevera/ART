@@ -1,0 +1,62 @@
+name: Package Install
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build wheel
+        run: python scripts/build_package.py --wheel
+
+      - name: Smoke test base wheel import
+        run: |
+          wheel_path="$(python - <<'PY'
+          from pathlib import Path
+
+          print(next(Path("dist").glob("openpipe_art-*.whl")).resolve())
+          PY
+          )"
+
+          project_dir="$(mktemp -d)"
+          cd "$project_dir"
+          uv init --name art-base-install-smoke --python 3.12 --bare
+          uv add "openpipe-art @ file://${wheel_path}"
+          uv run python -c "import importlib.util; assert importlib.util.find_spec('numpy') is None; assert importlib.util.find_spec('torch') is None; import art; from art.pipeline_trainer import PipelineTrainer; print(art.__name__, PipelineTrainer.__name__)"
+          uv add "weave==0.52.41"
+          uv run python -c "from weave.trace.settings import override_settings; import art"
+
+      - name: Smoke test uv add + sync for backend extra
+        run: |
+          wheel_path="$(python - <<'PY'
+          from pathlib import Path
+
+          print(next(Path("dist").glob("openpipe_art-*.whl")).resolve())
+          PY
+          )"
+
+          project_dir="$(mktemp -d)"
+          cd "$project_dir"
+          uv init --name art-install-smoke --python 3.12 --bare
+          uv add "openpipe-art[backend] @ file://${wheel_path}"
+          uv sync

@@ -8,15 +8,47 @@ if [ -f .env ]; then
         [[ $line =~ ^#.*$ ]] && continue
         [[ -z $line ]] && continue
         
-        # Export the variable
-        export "$line"
+        key="${line%%=*}"
+        current_value="${!key-}"
+        if [ -z "${!key+x}" ] ||
+            [ -z "${current_value}" ] ||
+            { [ "${key}" = "GIT_USER_NAME" ] && [ "${current_value}" = "Your Name" ]; } ||
+            { [ "${key}" = "GIT_USER_EMAIL" ] && [ "${current_value}" = "your.email@example.com" ]; } ||
+            { [ "${key}" = "INSTALL_EXTRAS" ] && [ "${current_value}" = "false" ]; }; then
+            export "$line"
+        fi
     done < .env
+fi
+
+if ! command -v sudo >/dev/null 2>&1; then
+    sudo_path="/usr/local/bin/sudo"
+    if [ ! -w /usr/local/bin ]; then
+        sudo_path="$HOME/.local/bin/sudo"
+        mkdir -p "$HOME/.local/bin"
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+
+    cat <<'EOF' > "$sudo_path"
+#!/bin/sh
+exec "$@"
+EOF
+    chmod +x "$sudo_path"
+fi
+
+need_pkgs=()
+command -v git >/dev/null 2>&1 || need_pkgs+=("git")
+command -v curl >/dev/null 2>&1 || need_pkgs+=("curl")
+command -v tmux >/dev/null 2>&1 || need_pkgs+=("tmux")
+
+if [ "${#need_pkgs[@]}" -gt 0 ]; then
+    apt-get update
+    apt-get install -y "${need_pkgs[@]}"
 fi
 
 # Configure git user name and email
 git config --global user.name "${GIT_USER_NAME}"
 git config --global user.email "${GIT_USER_EMAIL}"
-git config --global --add safe.directory /root/sky_workdir
+git config --global --add safe.directory "$(pwd)"
 
 if [ "${GIT_RESET_CLEAN:-true}" = "true" ]; then
     # Reset any uncommitted changes to the last commit
@@ -28,18 +60,19 @@ else
     echo "Skipping git reset/clean (GIT_RESET_CLEAN is not true). Preserving synced working tree."
 fi
 
-# Install astral-uv
-sudo snap install --classic astral-uv
-
-# Update uv
-uv self update
-
-# Install tmux
-apt install tmux -y
+# Install astral-uv (standalone version)
+# Always prepend standalone install path so it takes precedence over system/conda uv
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+if command -v uv >/dev/null 2>&1; then
+    echo "Using $(uv --version)"
+elif ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
+    echo "Failed to install uv." >&2
+    exit 1
+fi
 
 # Sync the dependencies
 if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
-    uv sync --all-extras
+    uv sync --extra backend --extra tinker --extra langgraph --extra plotting --frozen
 else
-    uv sync --extra backend
+    uv sync --extra backend --frozen
 fi

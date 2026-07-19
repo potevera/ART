@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import json
 import os
 import re
 import time
-from typing import Any, Awaitable, Iterable, Literal, TypeVar, cast
+from typing import Any, AsyncIterator, Awaitable, Iterable, Literal, TypeVar, cast
 import uuid
 
 from fastapi import FastAPI, HTTPException
@@ -23,17 +25,24 @@ from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenL
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.completion_usage import CompletionUsage
 import tinker
+from tinker_cookbook import renderers, tokenizer_utils
+import torch
 import uvicorn
 
-from art.tinker.cookbook_v import renderers, tokenizer_utils
-
 from .. import dev
+from ..adapter_leases import pin_inference_step, pinned_inference_step
 from ..backend import Backend
+from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
+from ..metrics_taxonomy import (
+    build_training_summary_metrics,
+    summarize_trajectory_groups,
+)
 from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
-from ..trajectories import TrajectoryGroup
-from ..types import TrainResult
+from ..trajectories import Trajectory, TrajectoryGroup
+from ..types import TrainResult, TrainSFTConfig
+from ..utils.lifecycle import process_shutdown_timeout
 from ..utils.output_dirs import get_model_dir
 from ..utils.trajectory_migration import auto_migrate_on_register
 from .data import (
@@ -44,7 +53,107 @@ from .data import (
 
 STATE_KEY_RUN_IDS = "tinker_run_ids"
 STATE_KEY_LATEST_STEP = "latest_step"
+_SERVER_CLOSE_TIMEOUT_SECONDS = process_shutdown_timeout(1)
 T = TypeVar("T")
+
+_UPSTREAM_TRAIN_METRIC_KEYS = {
+    "reward": "train/reward",
+    "reward_std_dev": "train/reward_std_dev",
+    "exception_rate": "train/exception_rate",
+    "policy_loss": "loss/train",
+    "loss": "loss/train",
+    "entropy": "loss/entropy",
+    "kl_div": "loss/kl_div",
+    "kl_policy_ref": "loss/kl_policy_ref",
+    "grad_norm": "loss/grad_norm",
+    "learning_rate": "loss/learning_rate",
+    "num_groups_submitted": "data/step_num_groups_submitted",
+    "num_groups_trainable": "data/step_num_groups_trainable",
+    "num_trajectories": "data/step_num_trajectories",
+    "num_trainable_tokens": "data/step_trainable_assistant_tokens",
+    "train_tokens": "data/step_trainable_assistant_tokens",
+    "num_datums": "data/step_num_datums",
+}
+
+
+def _canonicalize_upstream_metric_key(metric: str) -> str:
+    if "/" in metric:
+        return metric
+    if metric == "tokens_per_second":
+        return ""
+    if metric.startswith("group_metric_"):
+        return f"train/group/{metric[len('group_metric_') :]}"
+    return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
+
+
+async def _apply_kl_penalty(
+    datums: list[tinker.Datum],
+    reference_sampling_client: tinker.SamplingClient,
+    kl_penalty_coef: float,
+) -> dict[str, float]:
+    assert datums
+    assert kl_penalty_coef > 0.0
+
+    full_sequences: list[tinker.ModelInput] = []
+    sampled_logprobs_by_datum: list[torch.Tensor] = []
+    masks_by_datum: list[torch.Tensor] = []
+    advantages_by_datum: list[torch.Tensor] = []
+    for datum in datums:
+        target_tokens = datum.loss_fn_inputs["target_tokens"].to_torch()
+        assert target_tokens.numel() > 0
+        full_sequences.append(
+            datum.model_input.append_int(int(target_tokens[-1].item()))
+        )
+        sampled_logprobs_by_datum.append(datum.loss_fn_inputs["logprobs"].to_torch())
+        masks_by_datum.append(datum.loss_fn_inputs["mask"].to_torch().float())
+        advantages_by_datum.append(datum.loss_fn_inputs["advantages"].to_torch())
+
+    reference_logprobs_by_datum = await asyncio.gather(
+        *[
+            reference_sampling_client.compute_logprobs_async(full_sequence)
+            for full_sequence in full_sequences
+        ]
+    )
+
+    logprob_diffs_by_datum: list[torch.Tensor] = []
+    for reference_logprobs, sampled_logprobs, mask in zip(
+        reference_logprobs_by_datum,
+        sampled_logprobs_by_datum,
+        masks_by_datum,
+        strict=True,
+    ):
+        reference_values = reference_logprobs[1:]
+        assert len(reference_values) == sampled_logprobs.numel()
+        assert all(value is not None for value in reference_values)
+        reference_logprobs_tensor = torch.tensor(
+            reference_values,
+            dtype=sampled_logprobs.dtype,
+        )
+        logprob_diffs_by_datum.append(
+            (sampled_logprobs - reference_logprobs_tensor) * mask
+        )
+
+    total_tokens = torch.stack([mask.sum() for mask in masks_by_datum]).sum()
+    assert total_tokens.item() > 0
+    avg_logprob_diff = (
+        torch.stack(
+            [logprob_diff.sum() for logprob_diff in logprob_diffs_by_datum]
+        ).sum()
+        / total_tokens
+    )
+
+    for datum, advantages, mask, logprob_diff in zip(
+        datums,
+        advantages_by_datum,
+        masks_by_datum,
+        logprob_diffs_by_datum,
+        strict=True,
+    ):
+        datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(
+            advantages + kl_penalty_coef * (avg_logprob_diff - logprob_diff) * mask
+        )
+
+    return {"loss/kl_policy_ref": float(avg_logprob_diff)}
 
 
 @dataclass
@@ -62,6 +171,8 @@ class ModelState:
     tinker_run_ids: list[str]
     model_name: str
     server_task: asyncio.Task[None] | None = None
+    server: uvicorn.Server | None = None
+    server_shutdown_requested: bool = False
     server_host: str | None = None
     server_port: int | None = None
     server_api_key: str | None = None
@@ -73,7 +184,7 @@ class TinkerNativeModelConfig:
     training_client_args: dict[str, Any]
 
 
-class TinkerNativeBackend(Backend):
+class TinkerNativeBackend:
     _tinker_train_log_env = "ART_TINKER_TRAIN_LOG"
     _tinker_sample_log_env = "ART_TINKER_SAMPLE_LOG"
 
@@ -92,7 +203,11 @@ class TinkerNativeBackend(Backend):
 
         self._path = path or ".art"
         os.makedirs(self._path, exist_ok=True)
-        self._model_state: dict[str, ModelState] = {}
+        self._model_state: dict[tuple[str, str], ModelState] = {}
+
+    @staticmethod
+    def _model_key(model: Model) -> tuple[str, str]:
+        return model.project, model._storage_name()
 
     def _env_enabled(self, env_name: str) -> bool:
         value = os.getenv(env_name)
@@ -141,9 +256,27 @@ class TinkerNativeBackend(Backend):
         )
 
     async def close(self) -> None:
+        tasks: list[asyncio.Task[None]] = []
         for state in self._model_state.values():
             if state.server_task is not None:
-                state.server_task.cancel()
+                state.server_shutdown_requested = True
+                if state.server is not None:
+                    state.server.should_exit = True
+                tasks.append(state.server_task)
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=_SERVER_CLOSE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                for state in self._model_state.values():
+                    state.server_task = None
+                    state.server = None
 
     async def register(self, model: Model) -> None:
         model.base_path = self._path
@@ -159,15 +292,18 @@ class TinkerNativeBackend(Backend):
         if not model.trainable:
             return
         trainable_model = cast(TrainableModel, model)
+        pricing = get_model_pricing(trainable_model.base_model)
+        if pricing is not None:
+            trainable_model.set_cost_calculator(build_cost_calculator(pricing))
         state = await self._build_model_state(trainable_model)
-        self._model_state[model.name] = state
+        self._model_state[self._model_key(model)] = state
 
     async def _prepare_backend_for_training(
         self,
         model: TrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
-        state = self._model_state[model.name]
+        state = self._model_state[self._model_key(model)]
 
         raw_config: dict[str, Any] = cast(dict[str, Any], config) if config else {}
         server_args = cast(dict[str, Any], raw_config.get("server_args", {}))
@@ -184,13 +320,15 @@ class TinkerNativeBackend(Backend):
             state.server_task = asyncio.create_task(
                 self._run_openai_server(state, host=host, port=port)
             )
-            state.server_task.add_done_callback(self._crash_on_server_exit)
+            state.server_task.add_done_callback(
+                lambda task, state=state: self._crash_on_server_exit(state, task)
+            )
 
         base_url = f"http://{host}:{port}/v1"
         await self._wait_for_server_ready(base_url, api_key, model)
         return base_url, api_key
 
-    async def train(  # type: ignore[override]
+    async def train(
         self,
         model: TrainableModel,
         trajectory_groups: Iterable[TrajectoryGroup],
@@ -201,24 +339,68 @@ class TinkerNativeBackend(Backend):
         save_checkpoint: bool = False,
         loss_fn_config: dict | None = None,
         adam_params: tinker.AdamParams | None = None,
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_penalty_source: Literal["sample"] = "sample",
+        **kwargs: Any,
     ) -> TrainResult:
-        state = self._model_state[model.name]
+        assert kl_penalty_source == "sample", (
+            "TinkerNativeBackend only supports kl_penalty_source='sample'."
+        )
+
+        state = self._model_state[self._model_key(model)]
         groups_list = list(trajectory_groups)
+        summary = summarize_trajectory_groups(groups_list)
 
         datums = trajectory_groups_to_datums(
             groups_list,
             state.renderer,
             state.tokenizer,
             normalize_advantages,
+            base_model=model.base_model,
         )
 
         metrics: dict[str, float] = {
-            "num_groups_submitted": float(len(groups_list)),
-            "num_datums": float(len(datums)),
+            **build_training_summary_metrics(
+                summary,
+                include_trainable_groups=True,
+            ),
+            "data/step_num_datums": float(len(datums)),
         }
 
         if not datums:
             return TrainResult(step=state.current_step, metrics=metrics)
+
+        flattened_tokens = sum(len(datum.model_input.to_ints()) for datum in datums)
+        assistant_tokens = sum(
+            float(datum.loss_fn_inputs["mask"].to_torch().sum().item())
+            for datum in datums
+        )
+        metrics["data/step_trainable_assistant_tokens"] = assistant_tokens
+        metrics["data/step_flattened_train_tokens"] = float(flattened_tokens)
+        pricing = get_model_pricing(model.base_model)
+        if pricing is not None:
+            metrics["costs/train/tinker_train"] = compute_train_cost(
+                flattened_tokens, pricing
+            )
+        trainer_started = time.monotonic()
+        sampled_kl_policy_ref: float | None = None
+
+        if kl_penalty_coef > 0:
+            kl_metrics = await self._tinker_sample_call(
+                "apply_kl_penalty",
+                _apply_kl_penalty(
+                    datums,
+                    await self._get_kl_reference_sampling_client(
+                        state,
+                        model.base_model,
+                        kl_penalty_reference_step,
+                    ),
+                    kl_penalty_coef,
+                ),
+            )
+            sampled_kl_policy_ref = kl_metrics["loss/kl_policy_ref"]
+            metrics.update(kl_metrics)
 
         if adam_params is None:
             adam_params = tinker.AdamParams(
@@ -256,12 +438,26 @@ class TinkerNativeBackend(Backend):
             for key, value in forward_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if (
+                    sampled_kl_policy_ref is not None
+                    and canonical_key == "loss/kl_policy_ref"
+                ):
+                    continue
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
         if optim_output.metrics:
             for key, value in optim_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if (
+                    sampled_kl_policy_ref is not None
+                    and canonical_key == "loss/kl_policy_ref"
+                ):
+                    continue
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
 
         next_step = state.current_step + 1
         checkpoint_name = f"step_{next_step:06d}"
@@ -286,12 +482,27 @@ class TinkerNativeBackend(Backend):
 
         state.current_step = next_step
         self._persist_model_state(model, state)
+        metrics["time/step_backend_train_s"] = time.monotonic() - trainer_started
 
         return TrainResult(step=state.current_step, metrics=metrics)
 
+    async def _train_sft(
+        self,
+        model: TrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        raise NotImplementedError(
+            "TinkerNativeBackend does not support TrainableModel.train_sft()."
+        )
+        yield {}
+
     async def _get_step(self, model: TrainableModel) -> int:
-        if model.name in self._model_state:
-            return self._model_state[model.name].current_step
+        model_key = self._model_key(model)
+        if model_key in self._model_state:
+            return self._model_state[model_key].current_step
         state = model.read_state() or {}
         return int(state.get(STATE_KEY_LATEST_STEP, 0))
 
@@ -307,9 +518,29 @@ class TinkerNativeBackend(Backend):
         if "@" in base_name:
             base_name = base_name.split("@", 1)[0]
         if step is None:
-            state = self._model_state.get(model.name)
+            step = pinned_inference_step(model._storage_name())
+        if step is None:
+            state = self._model_state.get(self._model_key(model))
             step = state.current_step if state is not None else 0
         return f"{base_name}@{step}"
+
+    @asynccontextmanager
+    async def adapter_lease(
+        self,
+        model: TrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        async with pin_inference_step(model._storage_name(), step):
+            yield
+
+    @asynccontextmanager
+    async def exact_adapter_lease(
+        self,
+        model: TrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        async with self.adapter_lease(model, step):
+            yield
 
     async def _run_openai_server(
         self,
@@ -322,7 +553,7 @@ class TinkerNativeBackend(Backend):
         @app.post("/v1/chat/completions")
         async def chat_completions(body: CompletionCreateParams) -> ChatCompletion:
             model_name = body.get("model")
-            _, step = self._parse_model_name(model_name)
+            parsed_model_name, step = self._parse_model_name(model_name)
             sampler_client = await self._get_sampler_client(state, step)
 
             messages = self._normalize_messages(body["messages"])
@@ -379,7 +610,13 @@ class TinkerNativeBackend(Backend):
                             id=tool_call.get("id") or f"call_{idx}",
                             function=Function(
                                 name=tool_call["function"]["name"],
-                                arguments=tool_call["function"]["arguments"],
+                                arguments=(
+                                    tool_call["function"]["arguments"]
+                                    if isinstance(
+                                        tool_call["function"]["arguments"], str
+                                    )
+                                    else json.dumps(tool_call["function"]["arguments"])
+                                ),
                             ),
                         )
                         for idx, tool_call in enumerate(parsed_message["tool_calls"])
@@ -405,6 +642,8 @@ class TinkerNativeBackend(Backend):
                                 )
                             ]
                         ),
+                        prompt_token_ids=prompt_tokens,
+                        token_ids=list(sequence.tokens),
                     )
                 )
 
@@ -415,7 +654,7 @@ class TinkerNativeBackend(Backend):
                 id=str(uuid.uuid4()),
                 choices=choices,
                 created=int(time.time()),
-                model=self._format_response_model(model_name, step, state),
+                model=self._format_response_model(parsed_model_name, step),
                 object="chat.completion",
                 usage=CompletionUsage(
                     completion_tokens=completion_tokens,
@@ -426,9 +665,17 @@ class TinkerNativeBackend(Backend):
 
         server_config = uvicorn.Config(app, host=host, port=port, log_level="error")
         server = uvicorn.Server(server_config)
-        await server.serve()
+        state.server = server
+        if state.server_shutdown_requested:
+            server.should_exit = True
+        try:
+            await server.serve()
+        finally:
+            state.server = None
 
-    def _crash_on_server_exit(self, task: asyncio.Task[None]) -> None:
+    def _crash_on_server_exit(
+        self, state: ModelState, task: asyncio.Task[None]
+    ) -> None:
         try:
             task.result()
         except asyncio.CancelledError:
@@ -436,6 +683,8 @@ class TinkerNativeBackend(Backend):
         except Exception as exc:
             print(f"OpenAI server crashed: {exc}")
         else:
+            if state.server_shutdown_requested:
+                return
             print("OpenAI server exited unexpectedly.")
         os._exit(1)
 
@@ -469,6 +718,7 @@ class TinkerNativeBackend(Backend):
         renderer = renderers.get_renderer(
             name=config.renderer_name,
             tokenizer=tokenizer,
+            model_name=model.base_model,
         )
 
         saved_state = model.read_state() or {}
@@ -547,10 +797,7 @@ class TinkerNativeBackend(Backend):
 
     def _resolve_model_config(self, model: TrainableModel) -> TinkerNativeModelConfig:
         internal_config = model._internal_config or {}
-        tinker_native_args = cast(
-            dev.TinkerNativeArgs | None,
-            internal_config.get("tinker_native_args"),
-        )
+        tinker_native_args = internal_config.get("tinker_native_args")
         renderer_name = (
             tinker_native_args.get("renderer_name")
             if tinker_native_args is not None
@@ -565,7 +812,7 @@ class TinkerNativeBackend(Backend):
             else {}
         )
         if "rank" not in training_client_args:
-            training_client_args["rank"] = 8
+            training_client_args["rank"] = (model.lora_config or {}).get("rank", 1)
         if "train_unembed" not in training_client_args:
             training_client_args["train_unembed"] = False
 
@@ -632,6 +879,19 @@ class TinkerNativeBackend(Backend):
         state.sampler_clients[actual_step] = sampler_client
         return sampler_client
 
+    async def _get_kl_reference_sampling_client(
+        self,
+        state: ModelState,
+        base_model: str,
+        step: int | None,
+    ) -> tinker.SamplingClient:
+        if step is not None:
+            return await self._get_sampler_client(state, step)
+        return await self._tinker_sample_call(
+            "create_sampling_client_async",
+            state.service_client.create_sampling_client_async(base_model=base_model),
+        )
+
     def _normalize_messages(self, messages: Iterable[Any]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         for message in messages:
@@ -654,27 +914,32 @@ class TinkerNativeBackend(Backend):
                 normalized.append(dict(tool))
         return normalized
 
-    def _parse_model_name(
-        self, model_name: str | None
-    ) -> tuple[str | None, int | None]:
-        if model_name and "@" in model_name:
-            base_name, step_str = model_name.rsplit("@", 1)
-            try:
-                return base_name, int(step_str)
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid model step: {model_name}"
-                ) from exc
-        return model_name, None
+    def _parse_model_name(self, model_name: str | None) -> tuple[str, int]:
+        if not model_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Model name is required and must include an '@step' suffix. Use model.get_inference_name().",
+            )
+        if "@" not in model_name:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{model_name}' is missing an '@step' suffix. "
+                    "Use model.get_inference_name()."
+                ),
+            )
 
-    def _format_response_model(
-        self, model_name: str | None, step: int | None, state: ModelState
-    ) -> str:
-        if model_name is None:
-            return f"{state.model_name}@{state.current_step}"
-        if step is None and "@" not in model_name:
-            return f"{model_name}@{state.current_step}"
-        return model_name
+        base_name, step_str = model_name.rsplit("@", 1)
+        try:
+            return base_name, int(step_str)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid model step: {model_name}"
+            ) from exc
+
+    def _format_response_model(self, model_name: str, step: int) -> str:
+        # Echo back the explicit model@step used for this completion.
+        return f"{model_name}@{step}"
 
     async def _create_training_client_from_checkpoint(
         self,
@@ -766,3 +1031,141 @@ class TinkerNativeBackend(Backend):
                 STATE_KEY_LATEST_STEP: state.current_step,
             }
         )
+
+    async def _experimental_fork_checkpoint(
+        self,
+        model: Model,
+        from_model: str,
+        from_project: str | None = None,
+        from_s3_bucket: str | None = None,
+        not_after_step: int | None = None,
+        verbose: bool = False,
+        prefix: str | None = None,
+    ) -> None:
+        """Fork a checkpoint from another TinkerNative model to initialize this model.
+
+        Loads the source model's training checkpoint into the destination model's
+        training client directly via tinker:// paths. No local download needed.
+
+        Args:
+            model: The destination model to fork to (must already be registered).
+            from_model: The name of the source model to fork from.
+            from_project: The project of the source model. Defaults to model.project.
+            from_s3_bucket: Not supported for TinkerNativeBackend.
+            not_after_step: If provided, uses the latest checkpoint <= this step.
+            verbose: Whether to print verbose output.
+            prefix: Not applicable for TinkerNativeBackend.
+        """
+        if from_s3_bucket is not None:
+            raise NotImplementedError(
+                "from_s3_bucket is not supported for TinkerNativeBackend. "
+                "Tinker checkpoints are stored on Tinker infrastructure, not S3."
+            )
+
+        trainable_model = cast(TrainableModel, model)
+
+        model_key = self._model_key(trainable_model)
+        if model_key not in self._model_state:
+            raise RuntimeError(
+                f"Run '{trainable_model.run_name}' is not registered. "
+                "Call register() before forking."
+            )
+
+        from_project = from_project or model.project
+
+        # Read the source model's state.json to get its tinker_run_ids
+        source_state_dir = get_model_dir(
+            Model(name=from_model, project=from_project),
+            art_path=self._path,
+        )
+        source_state_path = f"{source_state_dir}/state.json"
+        import json
+
+        if not os.path.exists(source_state_path):
+            raise FileNotFoundError(
+                f"Source model state not found at {source_state_path}. "
+                f"Ensure the source model '{from_model}' has been trained "
+                f"with this backend."
+            )
+        with open(source_state_path, "r") as f:
+            source_state = json.load(f)
+
+        source_run_ids = list(source_state.get(STATE_KEY_RUN_IDS, []))
+        if not source_run_ids:
+            raise ValueError(
+                f"Source model '{from_model}' has no tinker run IDs in its state."
+            )
+
+        # List source model's checkpoints
+        dest_state = self._model_state[model_key]
+        training_paths, sampler_paths = await self._list_checkpoints(
+            dest_state.rest_client, source_run_ids
+        )
+
+        if not training_paths:
+            raise ValueError(
+                f"No training checkpoints found for source model '{from_model}'."
+            )
+
+        # Select the target step
+        available_steps = sorted(training_paths.keys())
+        if not_after_step is not None:
+            eligible_steps = [s for s in available_steps if s <= not_after_step]
+            if not eligible_steps:
+                raise ValueError(
+                    f"No checkpoint found at or before step {not_after_step}. "
+                    f"Available steps: {available_steps}"
+                )
+            target_step = max(eligible_steps)
+        else:
+            target_step = max(available_steps)
+
+        source_checkpoint_path = training_paths[target_step]
+        if verbose:
+            print(
+                f"Forking from '{from_model}' step {target_step} "
+                f"(checkpoint: {source_checkpoint_path})"
+            )
+
+        # Load the source checkpoint into a new training client
+        config = self._resolve_model_config(trainable_model)
+        new_training_client = await self._create_training_client_from_checkpoint(
+            service_client=dest_state.service_client,
+            checkpoint_state_path=source_checkpoint_path,
+            base_model=trainable_model.base_model,
+            training_client_args=config.training_client_args,
+            reset_optimizer=True,
+        )
+
+        # Save new sampler weights
+        checkpoint_name = f"step_{target_step:06d}"
+        sampler_response = await self._save_sampler_weights(
+            new_training_client, checkpoint_name
+        )
+
+        # Create a sampler client from the new weights
+        sampler_client = await self._tinker_train_call(
+            "create_sampling_client_async",
+            new_training_client.create_sampling_client_async(
+                model_path=sampler_response.path
+            ),
+        )
+
+        # Update the destination model's state
+        new_run_id = new_training_client.model_id
+        if new_run_id not in dest_state.tinker_run_ids:
+            dest_state.tinker_run_ids.append(new_run_id)
+
+        dest_state.training_client = new_training_client
+        dest_state.current_step = target_step
+        dest_state.sampler_clients[target_step] = sampler_client
+        dest_state.sampler_checkpoint_paths[target_step] = sampler_response.path
+        dest_state.training_checkpoint_paths[target_step] = source_checkpoint_path
+
+        self._persist_model_state(trainable_model, dest_state)
+
+        if verbose:
+            print(
+                f"Fork complete. Run '{trainable_model.run_name}' is now at "
+                f"step {target_step}."
+            )
