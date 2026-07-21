@@ -1,16 +1,17 @@
-import sqlite3
-import logging
-from typing import List, Optional
 from dataclasses import dataclass
+import logging
+import sqlite3
+from typing import List, Optional
 
 from art_e.data.local_email_db import DEFAULT_DB_PATH
 from art_e.data.types_enron import Email
-
 
 conn = None
 
 
 def get_conn():
+    # Shared read-only connection. Safe because all rollouts run on a single
+    # asyncio event loop; not safe to share across real threads.
     global conn
     if conn is None:
         conn = sqlite3.connect(
@@ -163,7 +164,7 @@ def read_email(message_id: str) -> Optional[Email]:
 
     # --- Query for Email Core Details ---
     email_sql = """
-        SELECT message_id, date, subject, from_address, body, file_name
+        SELECT id, message_id, date, subject, from_address, body, file_name
         FROM emails
         WHERE message_id = ?;
     """
@@ -175,6 +176,7 @@ def read_email(message_id: str) -> Optional[Email]:
         return None
 
     (
+        email_pk,
         msg_id,
         date,
         subject,
@@ -184,12 +186,13 @@ def read_email(message_id: str) -> Optional[Email]:
     ) = email_row
 
     # --- Query for Recipients ---
+    # recipients.email_id is an integer FK to emails.id, not the message_id string.
     recipients_sql = """
         SELECT recipient_address, recipient_type
         FROM recipients
         WHERE email_id = ?;
     """
-    cursor.execute(recipients_sql, (message_id,))
+    cursor.execute(recipients_sql, (email_pk,))
     recipient_rows = cursor.fetchall()
 
     to_addresses: List[str] = []

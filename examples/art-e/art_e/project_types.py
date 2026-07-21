@@ -1,11 +1,11 @@
-from pydantic import BaseModel
 from typing import Literal
+
+from pydantic import BaseModel
 
 
 class ProjectPolicyConfig(BaseModel):
     max_turns: int = 10
     max_tokens: int = 2048
-    log_to_openpipe: bool = False
     stupid_simple_reward_fn: bool = False
     include_qwen3_nothink: bool = False
 
@@ -27,7 +27,6 @@ class ProjectPolicyConfig(BaseModel):
 
     # Fork configuration
     fork_from_model: str | None = None
-    fork_from_project: str | None = None
     fork_not_after_step: int | None = None
 
     # Training configuration

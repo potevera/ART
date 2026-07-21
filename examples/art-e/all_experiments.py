@@ -10,7 +10,6 @@ models: dict[str, art.TrainableModel[ProjectPolicyConfig]] = {
         base_model="Qwen/Qwen2.5-14B-Instruct",
         config=ProjectPolicyConfig(
             max_turns=10,
-            log_to_openpipe=True,
             trajectories_per_group=6,
             groups_per_step=8,
             learning_rate=1.2e-5,

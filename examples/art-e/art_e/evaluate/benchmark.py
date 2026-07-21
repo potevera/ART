@@ -18,7 +18,14 @@ async def benchmark_model(
     val_scenarios = load_synthetic_queries(split="test", limit=limit)
 
     async def rollout_and_report(scenario: SyntheticQuery):
-        traj = await rollout(model, scenario)
+        # Return the exception instead of raising so one failed rollout (after
+        # its retries) doesn't abort the whole benchmark; failures are filtered
+        # out below.
+        try:
+            traj = await rollout(model, scenario)
+        except Exception as exc:
+            print(f"WARNING: rollout failed for scenario {scenario.id}: {exc}")
+            return exc
         if report:
             report_trajectory(model, traj, step)
         return traj

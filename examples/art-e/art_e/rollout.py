@@ -1,27 +1,32 @@
+from dataclasses import asdict, dataclass
+import json
+import logging
+import textwrap
 from typing import Any, Dict
-import art
+
 from art_e.data.types_enron import SyntheticQuery
-from art import Trajectory
-from litellm import acompletion
-import litellm
 from art_e.email_search_tools import (
-    search_emails as search_emails_impl,
-    read_email as read_email_impl,
     Email,
 )
-from langchain_core.utils.function_calling import convert_to_openai_tool
-from litellm.caching.caching import LiteLLMCacheType, Cache
-import json
-from litellm.types.utils import Choices, ModelResponse
-from dataclasses import asdict
-from art.utils.litellm import convert_litellm_choice_to_openai
-from dataclasses import dataclass
+from art_e.email_search_tools import (
+    read_email as read_email_impl,
+)
+from art_e.email_search_tools import (
+    search_emails as search_emails_impl,
+)
 from art_e.project_types import ProjectPolicyConfig
-import textwrap
-from tenacity import retry, stop_after_attempt
-import logging
-from pydantic import BaseModel, Field, validate_call, ValidationError
+from langchain_core.utils.function_calling import convert_to_openai_tool
+import litellm
+from litellm import acompletion
+from litellm.caching.caching import Cache, LiteLLMCacheType
+from litellm.types.utils import Choices, ModelResponse
+from pydantic import BaseModel, Field, ValidationError, validate_call
 from rich import print
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt
+
+import art
+from art import Trajectory
+from art.utils.litellm import convert_litellm_choice_to_openai
 
 litellm.cache = Cache(type=LiteLLMCacheType.DISK)
 litellm.drop_params = True
@@ -37,6 +42,7 @@ class FinalRubric:
     ever_found_right_email: bool = False
     ever_read_right_email: bool = False
     cant_parse_tool_call: bool = False
+    no_tool_calls: bool = False
     bad_tool_call_name: bool = False
     bad_tool_call_args: bool = False
     ran_out_of_turns: bool = False
@@ -49,7 +55,8 @@ class FinalRubric:
     def to_metrics(self) -> dict[str, float | int]:
         metrics: dict[str, float | int] = {k: int(v) for k, v in asdict(self).items()}
         metrics["failed_format_validation"] = int(
-            self.bad_tool_call_name
+            self.no_tool_calls
+            or self.bad_tool_call_name
             or self.bad_tool_call_args
             or self.cant_parse_tool_call
         )
@@ -76,7 +83,7 @@ def calculate_reward(
     if rubric.cant_parse_tool_call:
         return -2 + partial_rewards
 
-    if rubric.bad_tool_call_name:
+    if rubric.no_tool_calls or rubric.bad_tool_call_name:
         return -1.9 + partial_rewards
 
     if rubric.bad_tool_call_args:
@@ -193,7 +200,14 @@ def clean_message(message: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in message.items() if v is not None}
 
 
-@retry(stop=stop_after_attempt(3))
+# Retry transient failures (LLM/API errors), but not ValueError: that signals a
+# logic bug (e.g. an unhandled rubric state), and resampling failed episodes
+# silently would bias the training distribution.
+@retry(
+    stop=stop_after_attempt(3),
+    retry=retry_if_not_exception_type(ValueError),
+    reraise=True,
+)
 async def rollout(
     model: art.Model[ProjectPolicyConfig],
     scenario: SyntheticQuery,
@@ -208,7 +222,7 @@ async def rollout(
 
     system_prompt = textwrap.dedent(
         f"""\
-        You are an email search agent. You are given a user query and a list of tools you can use to search the user's email. Use the tools to search the user's emails and find the answer to the user's query. You may take up to {model.config.max_turns} turns to find the answer, so if your first seach doesn't find the answer, you can try with different keywords.
+        You are an email search agent. You are given a user query and a list of tools you can use to search the user's email. Use the tools to search the user's emails and find the answer to the user's query. You may take up to {model.config.max_turns} turns to find the answer, so if your first search doesn't find the answer, you can try with different keywords.
 
         User's email address is {scenario.inbox_address}
         Today's date is {scenario.query_date}
@@ -319,7 +333,7 @@ async def rollout(
         traj.messages_and_choices.append(convert_litellm_choice_to_openai(choice))  # type: ignore
 
         if choice.message.tool_calls is None:
-            rubric.bad_tool_call_name = True
+            rubric.no_tool_calls = True
             traj.messages_and_choices.append(
                 {
                     "role": "user",
@@ -390,9 +404,10 @@ async def rollout(
 
 
 if __name__ == "__main__":
+    import asyncio
+
     from art_e.data.query_iterators import load_synthetic_queries
     from dotenv import load_dotenv
-    import asyncio
     import yaml
 
     load_dotenv()

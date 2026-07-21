@@ -9,7 +9,6 @@ from art_e.data.types_enron import SyntheticQuery
 from art_e.evaluate.benchmark import benchmark_model
 from art_e.project_types import ProjectPolicyConfig
 from dotenv import load_dotenv
-import tenacity
 
 import art
 from art.local import LocalBackend
@@ -71,6 +70,27 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
             initial_step=await model.get_step(),
         )
 
+        async def judge_after_each(
+            group: art.TrajectoryGroup,
+        ) -> art.TrajectoryGroup | None:
+            """Optionally rescore a trajectory group with RULER.
+
+            If `model.config.ruler_judge_model` is set, run RULER to score the
+            group. `swallow_exceptions=True` makes RULER return None on failure,
+            so the group is filtered out by `gather_trajectory_groups` instead
+            of crashing the training run. If no judge is configured, return the
+            group as-is.
+            """
+
+            if model.config.ruler_judge_model is None:
+                return group
+
+            return await ruler_score_group(
+                group,
+                model.config.ruler_judge_model,
+                swallow_exceptions=True,
+            )
+
         for batch in train_iterator:
             if batch.step % model.config.eval_steps == 0:
                 print(f"\n--- Evaluating at Iteration {batch.step} ---")
@@ -79,30 +99,6 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                 await backend._experimental_push_to_s3(
                     model,
                     s3_bucket=os.environ["BACKUP_BUCKET"],
-                )
-
-            @tenacity.retry(
-                stop=tenacity.stop_after_attempt(3),
-            )
-            async def judge_after_each(
-                group: art.TrajectoryGroup,
-            ) -> art.TrajectoryGroup | None:
-                """Optionally judge a trajectory group and report its trajectories.
-
-                If `model.config.group_judge_model` is set, run `art_ruler` to score
-                the group. On success, report each trajectory and return the group.
-                If the judge raises an exception, print a warning and return None so
-                the group is filtered out by `gather_trajectory_groups`.
-                If no judge is configured, simply return the group as-is.
-                """
-
-                if model.config.ruler_judge_model is None:
-                    return group
-
-                return await ruler_score_group(
-                    group,
-                    model.config.ruler_judge_model,
-                    swallow_exceptions=True,
                 )
 
             groups = await art.gather_trajectory_groups(
