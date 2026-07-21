@@ -100,7 +100,7 @@ import art
 # Create model
 model = art.Model(
     name="gpt-4.1",  # Can also use your trained models
-    inference_model_name="openai/gpt-4.1"
+    inference_model_name="openai/gpt-4.1",
     project="email_agent",
 )
 

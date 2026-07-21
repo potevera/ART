@@ -1,19 +1,22 @@
-import art
-from art.local import LocalBackend
 import asyncio
-from dotenv import load_dotenv
-from typing import List
-from .rollout import rollout
-from art_e.data.query_iterators import load_synthetic_queries
-from art_e.data.types_enron import SyntheticQuery
-from art_e.data.local_email_db import generate_database
-from art.utils import iterate_dataset
-from art_e.project_types import ProjectPolicyConfig
-from art_e.evaluate.benchmark import benchmark_model
 import os
 import statistics
-from art.rewards import ruler_score_group
+from typing import List
+
+from art_e.data.local_email_db import generate_database
+from art_e.data.query_iterators import load_synthetic_queries
+from art_e.data.types_enron import SyntheticQuery
+from art_e.evaluate.benchmark import benchmark_model
+from art_e.project_types import ProjectPolicyConfig
+from dotenv import load_dotenv
 import tenacity
+
+import art
+from art.local import LocalBackend
+from art.rewards import ruler_score_group
+from art.utils import iterate_dataset
+
+from .rollout import rollout
 
 load_dotenv()
 
@@ -25,12 +28,11 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
         print(
             f"Pulling latest checkpoint from S3 bucket: `{os.environ['BACKUP_BUCKET']}`"
         )
-        await backend._experimental_pull_from_s3(
+        await backend._experimental_pull_model_checkpoint(
             model,
+            step="latest",  # Only pull the latest checkpoint
             s3_bucket=os.environ["BACKUP_BUCKET"],
             verbose=True,
-            only_step="latest",  # Only pull the latest checkpoint
-            exclude=["trajectories"],  # Exclude trajectories to save space/time
         )
 
         # Handle fork configuration if specified
@@ -155,14 +157,19 @@ async def train(model: art.TrainableModel[ProjectPolicyConfig]):
                     )
                     continue  # Proceed to next batch/epoch without training.
 
-            await model.train(
+            result = await backend.train(
+                model,
                 groups,
-                config=art.TrainConfig(learning_rate=model.config.learning_rate),
-                _config=art.dev.TrainConfig(
-                    allow_training_without_logprobs=model.config.messages_only,
-                    scale_rewards=model.config.scale_rewards,
-                    importance_sampling_level=model.config.importance_sampling_level,
-                ),
+                learning_rate=model.config.learning_rate,
+                scale_rewards=model.config.scale_rewards,
+                importance_sampling_level=model.config.importance_sampling_level,
+                allow_training_without_logprobs=model.config.messages_only,
+            )
+            await model.log(
+                groups,
+                metrics=result.metrics,
+                step=result.step,
+                split="train",
             )
 
         await benchmark_model(model, step=batch.step)

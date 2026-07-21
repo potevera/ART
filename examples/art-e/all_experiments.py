@@ -1,10 +1,11 @@
-import art
 from art_e.project_types import ProjectPolicyConfig
 
+import art
 
 models: dict[str, art.TrainableModel[ProjectPolicyConfig]] = {
     "002": art.TrainableModel(
         name="email-agent-002",
+        run_name="email-agent-002",
         project="email_agent",
         base_model="Qwen/Qwen2.5-14B-Instruct",
         config=ProjectPolicyConfig(
@@ -235,3 +236,8 @@ models["234"] = models["206"].model_copy(deep=True)
 models["234"].name = "email-agent-234"
 models["234"].config.importance_sampling_level = "sequence"
 models["234"].config.num_epochs = 10
+
+# Keep the durable run_name aligned with each variant's serving name. The
+# variants above only override `name` after copying model 002.
+for _model in models.values():
+    _model.run_name = _model.name

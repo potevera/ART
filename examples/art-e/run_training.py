@@ -4,19 +4,19 @@
 # uv run run_training.py --models=210-16,210-% --fast  # Run 210-16 and all 210-* models
 
 import argparse
-import sky
-from art_e.project_types import ProjectPolicyConfig
-import json
-import textwrap
 import concurrent.futures
-import traceback
-from dotenv import dotenv_values, load_dotenv
-from sky import ClusterStatus
-import random
-import os
 import fnmatch
+import json
+import os
+import random
+import textwrap
+import traceback
 
 from all_experiments import models
+from art_e.project_types import ProjectPolicyConfig
+from dotenv import dotenv_values, load_dotenv
+import sky
+from sky import ClusterStatus
 
 load_dotenv()
 
@@ -86,6 +86,7 @@ def launch_model(model_key: str):
             suffix = f"-{args.add_suffix}"
 
         model.name = f"{model.name}{suffix}"
+        model.run_name = model.name
         print(f"Launching {model_key} as {model.name} on SkyPilot…")
     else:
         print(f"Launching {model_key} ({model.name}) on SkyPilot…")
